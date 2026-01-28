@@ -1,0 +1,40 @@
+# ViKi – Virtual Kinderklinik MVP
+
+Minimal viable product for a virtual pediatric clinic that ingests secure NetSfere consults and provides a specialist-facing portal to review and respond.
+
+## Repos Structure
+
+| Path | Description |
+| --- | --- |
+| `infra/` | Bicep templates for Azure resources (Functions, Service Bus, Key Vault, Storage, App Insights). |
+| `backend/` | Azure Functions TypeScript app handling NetSfere webhooks and queueing consults. |
+| `frontend/` | Next.js specialist portal MVP. |
+| `docs/` | Architecture notes and operational guidance. |
+
+## Quickstart
+
+1. **Provision Infrastructure**
+   - Update `infra/main.bicep` parameters with your environment details.
+   - Deploy via `az deployment group create ...` as outlined in `infra/README.md`.
+2. **Configure NetSfere**
+   - Enable API + webhook for the bot identity (e.g., `botdo@sweethomeonline.de`).
+   - Point the webhook to `https://<function-app>.azurewebsites.net/api/netsfere-webhook`.
+3. **Run Backend Locally**
+   ```
+   cd backend/functions
+   npm install
+   npm run build
+   npm start
+   ```
+4. **Run Specialist Portal**
+   ```
+   cd frontend/portal
+   npm install
+   npm run dev
+   ```
+
+## Next Steps
+- Replace mock data in the portal with a REST endpoint sourcing Service Bus output.
+- Add attachment ingestion + storage binding in the backend.
+- Integrate Azure Speech + GPT-4o for real-time conversational reviews.
+- Harden credential management by sourcing NetSfere secrets from Key Vault.

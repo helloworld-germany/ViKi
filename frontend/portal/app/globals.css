@@ -1,0 +1,22 @@
+:root {
+  --bg: #0b1221;
+  --card: #111b31;
+  --accent: #00b4d8;
+  --text: #e5f2ff;
+  --muted: #94a3b8;
+}
+
+html, body {
+  background: radial-gradient(circle at top, #12203f, #050914 60%);
+  color: var(--text);
+  font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+  min-height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: var(--accent);
+}
