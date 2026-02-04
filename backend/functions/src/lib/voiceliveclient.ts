@@ -8,6 +8,8 @@ import type { StoredConsult } from './consultRepository';
 export async function createVoiceLiveSession(consult: StoredConsult, callbacks?: { 
   onAudioData?: (data: Uint8Array) => void;
   onInputStarted?: () => void;
+}, options?: {
+  vadThreshold?: number;
 }): Promise<VoiceLiveSession> {
   const env = getEnv();
 
@@ -64,7 +66,7 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
     },
     turnDetection: {
       type: 'server_vad',
-      threshold: 0.5,
+      threshold: options?.vadThreshold ?? 0.5,
     },
     inputAudioFormat: 'pcm16',
     outputAudioFormat: 'pcm16',
@@ -75,23 +77,51 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
   // Handle function calls
   session.subscribe({
     onResponseFunctionCallArgumentsDone: async (event, context) => {
-      if (event.name === "get_weather") {
-        console.log(`[Tool Call] get_weather called with arguments: ${event.arguments}`);
-        const args = JSON.parse(event.arguments);
-        const weatherData = await getWeatherData(args.location);
-        console.log(`[Tool Result] Returning:`, JSON.stringify(weatherData));
+      try {
+        if (event.name === "get_weather") {
+            console.log(`[Tool Call] get_weather called with arguments: '${event.arguments}'`);
+            let args: any = {};
+            if (event.arguments && event.arguments.trim().length > 0) {
+                try {
+                    args = JSON.parse(event.arguments);
+                } catch (e) {
+                    console.error("Failed to parse arguments:", event.arguments);
+                    throw new Error("Invalid JSON arguments");
+                }
+            }
 
-        // Send function result back
-        await session.addConversationItem({
-          type: "function_call_output",
-          callId: event.callId,
-          output: JSON.stringify(weatherData),
-        } as any);
+            if (!args.location) {
+                throw new Error("Missing required argument: location");
+            }
+            
+            const weatherData = await getWeatherData(args.location);
+            console.log(`[Tool Result] Returning:`, JSON.stringify(weatherData));
 
-        // Request response generation
-        await session.sendEvent({
-          type: "response.create",
-        });
+            // Send function result back
+            await session.addConversationItem({
+            type: "function_call_output",
+            callId: event.callId,
+            output: JSON.stringify(weatherData),
+            } as any);
+
+            // Request response generation
+            await session.sendEvent({
+            type: "response.create",
+            });
+        }
+      } catch (error: any) {
+          console.error(`[Tool Call] Error processing ${event.name}:`, error);
+          // Send error back to help model recover
+          try {
+            await session.addConversationItem({
+                type: "function_call_output",
+                callId: event.callId,
+                output: JSON.stringify({ error: "Failed to execute tool: " + error.message }),
+            } as any);
+            await session.sendEvent({ type: "response.create" });
+          } catch (innerError) {
+              console.error("Failed to report error to session:", innerError);
+          }
       }
     },
     onResponseAudioDelta: async (event, context) => {
