@@ -5,15 +5,93 @@ import { API_BASE_URL } from '../lib/config';
 
 type Props = {
   consultId?: string;
+  isOffline?: boolean;
 };
 
 type VoiceStatus = 'idle' | 'connecting' | 'live' | 'error';
 
-export function VoiceConsole({ consultId }: Props) {
+function base64ToUint8Array(base64: string) {
+    const binaryString = window.atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+}
+
+
+class ReorderBuffer {
+    private expected = 1; // Backend starts at 1
+    private pending = new Map<number, Float32Array>();
+    private initialized = false; // Track if we've seen the first packet
+    
+    push(seq: number, data: Float32Array) {
+        // Auto-initialize expected from first packet to avoid deadlock
+        if (!this.initialized) {
+            this.expected = seq;
+            this.initialized = true;
+            console.log(`[ReorderBuffer] Auto-initialized expected to ${seq} from first packet`);
+        }
+        this.pending.set(seq, data);
+        console.log(`[ReorderBuffer] Push S=${seq}. Expected=${this.expected}. Pending=${this.pending.size}`);
+    }
+    
+    popReady(): Float32Array[] {
+        const out: Float32Array[] = []; 
+        while (this.pending.has(this.expected)) {
+            out.push(this.pending.get(this.expected)!);
+            this.pending.delete(this.expected);
+            this.expected += 1;
+        }
+        if (out.length > 0) {
+            console.log(`[ReorderBuffer] Popped ${out.length} chunks. NewExpected=${this.expected}`);
+        }
+        return out;
+    }
+    
+    // Resync: Jump to a new sequence if we're too far behind
+    resync(newSeq: number) {
+        console.log(`[ReorderBuffer] RESYNC: Jumping from expected=${this.expected} to ${newSeq}`);
+        this.expected = newSeq;
+    }
+    
+    // Flush: Return all pending chunks regardless of order (for emergency playback)
+    flush(): Float32Array[] {
+        const out: Float32Array[] = [];
+        // Sort by sequence and return all
+        const sorted = Array.from(this.pending.entries()).sort((a, b) => a[0] - b[0]);
+        for (const [seq, data] of sorted) {
+            out.push(data);
+        }
+        if (out.length > 0) {
+            console.log(`[ReorderBuffer] FLUSH: Returning ${out.length} chunks out-of-order`);
+            // Update expected to highest + 1
+            const maxSeq = sorted[sorted.length - 1]?.[0] ?? this.expected;
+            this.expected = maxSeq + 1;
+        }
+        this.pending.clear();
+        return out;
+    }
+    
+    getExpected() { return this.expected; }
+    getPendingSize() { return this.pending.size; }
+    
+    reset() {
+        console.log(`[ReorderBuffer] RESET`);
+        this.expected = 1;
+        this.initialized = false;
+        this.pending.clear();
+    }
+}
+
+export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const [status, setStatus] = useState<VoiceStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [incomingVolume, setIncomingVolume] = useState<number>(0);
   const [micVolume, setMicVolume] = useState<number>(0);
+  const [debugLog, setDebugLog] = useState<string>("Ready"); 
+  const [rxCount, setRxCount] = useState<number>(0);
+  const [showDebug, setShowDebug] = useState<boolean>(false);
 
   // Audio Processing Refs
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -21,10 +99,61 @@ export function VoiceConsole({ consultId }: Props) {
   const processorRef = useRef<AudioNode | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const isPendingStopRef = useRef<boolean>(false);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const serverReadyRef = useRef<boolean>(false);
+  const reorderBufferRef = useRef<ReorderBuffer>(new ReorderBuffer());
+  const playerNodeRef = useRef<AudioWorkletNode | null>(null);
+  const bufferedSamplesRef = useRef<number>(0);
+  const isPlayingRef = useRef<boolean>(false);
+  const earlyChunkQueueRef = useRef<{seq: number, data: Float32Array}[]>([]); // Queue for chunks arriving before worklet ready
+  
+  // Analyser Refs
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+
+  const stopPlayback = useCallback((ctx: AudioContext) => {
+    console.log("[VoiceConsole] Interrupt! Stopping playback (Barge-in)");
+    
+    // Clear legacy nodes
+    activeSourcesRef.current.forEach(node => {
+        try { node.stop(); } catch(e) {}
+    });
+    activeSourcesRef.current = [];
+
+    // Clear Worklet
+    if (playerNodeRef.current) {
+        playerNodeRef.current.port.postMessage({ cmd: 'stop' });
+    }
+    bufferedSamplesRef.current = 0;
+    isPlayingRef.current = false;
+    reorderBufferRef.current.reset();
+
+    // Reset Start Time to now so new audio plays immediately
+    nextStartTimeRef.current = ctx.currentTime;
+  }, []);
 
   const cleanup = useCallback(() => {
     isPendingStopRef.current = true;
     
+    if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+    }
+
+    if (playerNodeRef.current) {
+        playerNodeRef.current.disconnect();
+        playerNodeRef.current = null;
+    }
+    
+    if (audioContextRef.current) {
+        // We can't use stopPlayback here directly if ctx is null/closed, 
+        // but manually cleaning sources is good practice
+        activeSourcesRef.current.forEach(node => {
+            try { node.stop(); } catch(e) {}
+        });
+        activeSourcesRef.current = [];
+    }
+
     if (processorRef.current) {
         processorRef.current.disconnect();
         processorRef.current = null;
@@ -41,6 +170,8 @@ export function VoiceConsole({ consultId }: Props) {
     }
     
     setStatus('idle');
+    setMicVolume(0);
+    setIncomingVolume(0);
   }, []);
 
   useEffect(() => {
@@ -53,29 +184,233 @@ export function VoiceConsole({ consultId }: Props) {
     }
   }, [consultId, status, cleanup]);
 
+  const testAudio = () => {
+    try {
+        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            audioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+        }
+        const ctx = audioContextRef.current;
+        if (ctx.state === 'suspended') ctx.resume();
+        
+        const osc = ctx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(440, ctx.currentTime);
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+        
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.5);
+        setDebugLog("Test Tone Played");
+    } catch(e: any) {
+        setDebugLog("Test Tone Err: " + e.message);
+    }
+  };
+
+  const playAudioChunk = (data: Uint8Array, ctx: AudioContext, seq: number) => {
+      // Safety: Resume AudioContext if suspended (browser autoplay policy)
+      if (ctx.state === 'closed') {
+          console.warn(`[VoiceConsole] AudioContext is CLOSED. Cannot play S=${seq}.`);
+          return;
+      }
+      if (ctx.state === 'suspended') {
+          console.log(`[VoiceConsole] AudioContext SUSPENDED. Resuming...`);
+          ctx.resume().catch(e => console.warn("Resume failed", e));
+      }
+
+      // Decode Int16 -> Float32 with SOFT LIMITER (no hard clipping)
+      const bufferCopy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      const int16 = new Int16Array(bufferCopy);
+      
+      const float32 = new Float32Array(int16.length);
+      const PLAYBACK_GAIN = 1.0; // Reduced from 1.2 to avoid distortion
+      
+      // Soft limiter function (tanh-based) - preserves dynamics without harsh clipping
+      const softLimit = (x: number) => Math.tanh(x * 1.5) / Math.tanh(1.5);
+      
+      let sumSq = 0;
+      for (let i = 0; i < int16.length; i++) {
+          const raw = (int16[i] / 32768.0) * PLAYBACK_GAIN;
+          float32[i] = softLimit(raw); // Soft limit instead of hard clamp
+          sumSq += float32[i] * float32[i];
+      }
+      
+      const rms = Math.sqrt(sumSq / int16.length);
+      const rb = reorderBufferRef.current;
+      
+      console.log(`[VoiceConsole] RX Chunk: S=${seq}, Bytes=${data.length}, RMS=${rms.toFixed(4)}, Expected=${rb.getExpected()}, Buffered=${bufferedSamplesRef.current}, Playing=${isPlayingRef.current}`);
+      setDebugLog(`S=${seq} | Exp=${rb.getExpected()} | Buf=${bufferedSamplesRef.current} | Play=${isPlayingRef.current}`);
+
+      try {
+        const node = playerNodeRef.current;
+        
+        // If Worklet not ready yet, queue for later
+        if (!node) {
+            console.log(`[VoiceConsole] Worklet NOT READY. Queuing S=${seq} for later.`);
+            earlyChunkQueueRef.current.push({ seq, data: float32 });
+            return;
+        }
+        
+        // RESYNC CHECK: If incoming seq is way ahead of expected, resync
+        const GAP_THRESHOLD = 10;
+        if (seq > rb.getExpected() + GAP_THRESHOLD) {
+            console.warn(`[VoiceConsole] Large gap detected! S=${seq} vs Expected=${rb.getExpected()}. Resyncing.`);
+            rb.resync(seq);
+        }
+        
+        // Push to ReorderBuffer
+        rb.push(seq, float32);
+        
+        // FLUSH CHECK: If too many pending, flush to avoid stall
+        const MAX_PENDING = 20;
+        let readyChunks: Float32Array[];
+        if (rb.getPendingSize() > MAX_PENDING) {
+            console.warn(`[VoiceConsole] Pending buffer overflow (${rb.getPendingSize()}). Flushing.`);
+            readyChunks = rb.flush();
+        } else {
+            readyChunks = rb.popReady();
+        }
+        
+        // Send ready chunks to Worklet
+        if (readyChunks.length > 0) {
+            readyChunks.forEach(chunk => {
+                // Clone buffer before transfer (transfer detaches the original)
+                const clone = new Float32Array(chunk);
+                node.port.postMessage(clone, [clone.buffer]);
+                bufferedSamplesRef.current += chunk.length;
+            });
+            console.log(`[VoiceConsole] Sent ${readyChunks.length} chunks to Worklet. TotalBuffered=${bufferedSamplesRef.current}`);
+        }
+        
+        // Pre-roll / Warm-up: Wait for ~300ms (7200 samples) before starting playback
+        // This prevents chopped beginnings by ensuring buffer is primed
+        const TARGET_LATENCY_SAMPLES = 24000 * 0.3; // 300ms pre-roll
+        
+        if (!isPlayingRef.current && bufferedSamplesRef.current >= TARGET_LATENCY_SAMPLES) {
+            console.log(`[VoiceConsole] Pre-roll complete (${bufferedSamplesRef.current}/${TARGET_LATENCY_SAMPLES}). Sending START command.`);
+            node.port.postMessage({ cmd: 'start' });
+            isPlayingRef.current = true;
+        }
+      } catch (e) {
+          console.warn("[VoiceConsole] Playback error:", e);
+      }
+  };
+
   const startSession = async () => {
     if (!consultId) return;
-
+    
+    console.log(`[VoiceConsole] Starting session for consult: ${consultId}`);
     setStatus('connecting');
     setError(null);
     isPendingStopRef.current = false;
+    activeSourcesRef.current = [];
+
 
     try {
         // 1. Setup AudioContext (request 24kHz for compatibility)
+        console.log("[VoiceConsole] Initializing AudioContext (24kHz)...");
         const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
         const ctx = new AudioContextClass({ sampleRate: 24000 });
         audioContextRef.current = ctx;
         nextStartTimeRef.current = ctx.currentTime;
+        
+        // Log actual sample rate for debugging
+        console.log(`[VoiceConsole] AudioContext actual sampleRate: ${ctx.sampleRate}Hz, state: ${ctx.state}`);
+        
+        // Setup Analyser
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyserRef.current = analyser;
+        analyser.connect(ctx.destination);
+
+        // Setup AudioWorklet Node (Jitter Buffer)
+        try {
+            console.log("[VoiceConsole] Loading PCM Player Worklet...");
+            await ctx.audioWorklet.addModule('/pcm-player.js');
+            const playerNode = new AudioWorkletNode(ctx, 'pcm-player');
+            playerNode.port.onmessage = (e) => {
+                 if (e.data.type === 'debug') console.log("[Worklet]", e.data.msg);
+                 if (e.data.type === 'heartbeat') console.log(`[Worklet Heartbeat] Frame=${e.data.frame}, QueueSize=${e.data.queueSize}, Started=${e.data.started}, Played=${e.data.played}`);
+            };
+            playerNode.connect(analyser);
+            playerNodeRef.current = playerNode;
+            reorderBufferRef.current.reset();
+            bufferedSamplesRef.current = 0;
+            isPlayingRef.current = false;
+            
+            // Flush any early chunks that arrived before worklet was ready
+            if (earlyChunkQueueRef.current.length > 0) {
+                console.log(`[VoiceConsole] Flushing ${earlyChunkQueueRef.current.length} early chunks to worklet...`);
+                earlyChunkQueueRef.current.forEach(({ seq, data }) => {
+                    reorderBufferRef.current.push(seq, data);
+                });
+                const readyChunks = reorderBufferRef.current.popReady();
+                readyChunks.forEach(chunk => {
+                    const clone = new Float32Array(chunk);
+                    playerNode.port.postMessage(clone, [clone.buffer]);
+                    bufferedSamplesRef.current += chunk.length;
+                });
+                earlyChunkQueueRef.current = [];
+                console.log(`[VoiceConsole] Early chunk flush complete. Buffered=${bufferedSamplesRef.current}`);
+            }
+        } catch (e) {
+            console.error("[VoiceConsole] Worklet load failed:", e);
+        }
+        
+        // Start Analysis Loop
+        const updateVisuals = () => {
+             if (status === 'error' || isPendingStopRef.current || !analyserRef.current) return;
+             
+             const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+             analyserRef.current.getByteTimeDomainData(dataArray);
+             
+             // Calculate RMS
+             let sum = 0;
+             for(let i = 0; i < dataArray.length; i++) {
+                 // Convert 128-center byte to -1..1 float
+                 const float = (dataArray[i] - 128) / 128.0; 
+                 sum += float * float;
+             }
+             const rms = Math.sqrt(sum / dataArray.length);
+             
+             // Visualization Gain (Boost small signals)
+             setIncomingVolume(Math.min(100, rms * 400 * 100)); // *100 for percentage
+             
+             animationFrameRef.current = requestAnimationFrame(updateVisuals);
+        };
+        animationFrameRef.current = requestAnimationFrame(updateVisuals);
+
+        console.log(`[VoiceConsole] AudioContext created. State: ${ctx.state}`);
 
         // Load AudioWorklet Module
         try {
+            console.log("[VoiceConsole] Loading AudioWorklet module...");
             await ctx.audioWorklet.addModule('/pcm-processor.js');
+            console.log("[VoiceConsole] AudioWorklet loaded successfully.");
         } catch (e) {
-            console.warn("Failed to load worklet, falling back involves complex logic not implemented here since we expect worklet support.");
+            console.warn("[VoiceConsole] Failed to load worklet", e);
             throw new Error("AudioWorklet support required");
         }
+        
+        // Start Mic immediately (visual feedback + user gesture context)
+        await startMic(ctx);
 
+        // Start Downlink (Non-blocking await? No, we await connection init but stream is async)
+        await connectDownlink(ctx);
+        
+    } catch (err: any) {
+        console.error("[VoiceConsole] Session Error:", err);
+        setError(err.message || 'Error starting session');
+        cleanup();
+    }
+  };
+
+  const startMic = async (ctx: AudioContext) => {
         // 2. Get Microphone Stream
+        console.log("[VoiceConsole] Requesting microphone access...");
         if (!navigator.mediaDevices?.getUserMedia) {
             throw new Error("Microphone access not supported");
         }
@@ -83,302 +418,360 @@ export function VoiceConsole({ consultId }: Props) {
             audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
-                autoGainControl: true
+                autoGainControl: true,
+                sampleRate: 24000 
             } 
         });
+        console.log("[VoiceConsole] Microphone stream obtained.");
         mediaStreamRef.current = stream;
 
         const source = ctx.createMediaStreamSource(stream);
         const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
         processorRef.current = workletNode;
 
+        // Create a silent sink to keep the worklet running without loopback to speakers
+        const silentGain = ctx.createGain();
+        silentGain.gain.value = 0;
+
         source.connect(workletNode);
-        workletNode.connect(ctx.destination); // Keep alive
+        workletNode.connect(silentGain);
+        silentGain.connect(ctx.destination); 
+        console.log("[VoiceConsole] Audio graph connected (Loopback muted).");
 
         // 3. Create Request Stream Processing Loop
-        // Instead of one long Fetch, we accumulate and send chunks
-        const CHUNK_SIZE_MS = 250; 
-        const SAMPLE_RATE = 24000;
+        const CHUNK_SIZE_MS = 100; // Reduced from 250ms for lower latency
+        const SAMPLE_RATE = 24000; 
         const BYTES_PER_SAMPLE = 2; // Int16
-        const BYTES_PER_MS = (SAMPLE_RATE * BYTES_PER_SAMPLE) / 1000;
-        // ~ 12000 bytes for 250ms
-        const targetBufferSize = BYTES_PER_MS * CHUNK_SIZE_MS;
+        const BUFFER_SIZE = (SAMPLE_RATE * CHUNK_SIZE_MS) / 1000 * BYTES_PER_SAMPLE; 
+        const DIGITAL_GAIN = 5.0; // Reduced from 15.0 to prevent clipping
+        const PRE_AMP = 1.0;      // Reduced from 2.0
 
-        let bufferAccumulator: Uint8Array = new Uint8Array(0);
+        let pcmBuffer = new Uint8Array(0);
+        let uploadQueue = Promise.resolve();
 
-        workletNode.port.onmessage = async (e) => {
-            if (isPendingStopRef.current) return;
-            const newChunk = new Uint8Array(e.data); // Int16 buffer
+        workletNode.port.onmessage = (event) => {
+            if (status === 'error' || isPendingStopRef.current) return;
+            // Float32 -> Int16 conversion
+            const float32 = new Float32Array(event.data);
             
-            // Append
-            const tmp = new Uint8Array(bufferAccumulator.length + newChunk.length);
-            tmp.set(bufferAccumulator, 0);
-            tmp.set(newChunk, bufferAccumulator.length);
-            bufferAccumulator = tmp;
+            // Adaptive Noise Gate with attack/release to avoid choppy speech
+            let sumSq = 0;
+            for(let i=0; i<float32.length; i++) {
+                sumSq += float32[i] * float32[i];
+            }
+            const rms = Math.sqrt(sumSq / float32.length);
+            
+            // Adaptive threshold: Very low to avoid cutting speech
+            const NOISE_GATE_THRESHOLD = 0.001; // Lowered further
+            const isSilence = rms < NOISE_GATE_THRESHOLD;
+            
+            // Note: Attack/release should be implemented in a stateful manner
+            // For now, we just use a very low threshold to avoid cutting speech
 
-            if (bufferAccumulator.length >= targetBufferSize) {
-                const toSend = bufferAccumulator;
-                
-                // Calculate Mic Volume (RMS) for UI feedback
-                // View as Int16 to get correct amplitude
-                const int16View = new Int16Array(toSend.buffer, toSend.byteOffset, toSend.byteLength / 2);
-                let sumSq = 0;
-                // Sample every 4th point to save CPU
-                for(let i = 0; i < int16View.length; i += 4) {
-                    const v = int16View[i] / 32768.0;
-                    sumSq += v*v;
+            // Debug RMS occasionally
+            if (Math.random() < 0.05) {
+                 // setDebugLog(`RMS: ${rms.toFixed(5)} Gate: ${isSilence ? 'ON' : 'OFF'}`);
+            }
+
+            const int16 = new Int16Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+                // Apply gain and clip
+                // If silence, zero it out.
+                const sample = isSilence ? 0 : float32[i];
+                const s = Math.max(-1, Math.min(1, sample * DIGITAL_GAIN * PRE_AMP));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+
+            const newBuffer = new Uint8Array(pcmBuffer.length + int16.byteLength);
+            newBuffer.set(pcmBuffer);
+            newBuffer.set(new Uint8Array(int16.buffer), pcmBuffer.length);
+            pcmBuffer = newBuffer;
+
+            // Visual Mic Volume
+            // Use the calculated RMS, but if gated, show 0 to match reality
+            // We use a separate higher gain for visualization so the bar moves clearly even when speaking softly.
+            const VISUAL_GAIN = 50.0; 
+            const visualRms = isSilence ? 0 : (rms * VISUAL_GAIN);
+            setMicVolume(v => Math.max(v * 0.85, visualRms * 100)); // Smooth decay (0.85 per ~5ms frame)
+
+            if (pcmBuffer.length >= BUFFER_SIZE) {
+                // FIX: Don't drop data while waiting for connection
+                if (!serverReadyRef.current) {
+                    setDebugLog(`Buffering (${pcmBuffer.length})...`);
+                    // Cap buffer to ~256KB (approx 5 seconds) to avoid sending stale audio
+                    if (pcmBuffer.length > 256 * 1024) {
+                         pcmBuffer = pcmBuffer.slice(BUFFER_SIZE); // Drop oldest frame
+                    }
+                    return;
                 }
-                const rms = Math.sqrt(sumSq / (int16View.length / 4));
-                setMicVolume(Math.min(100, rms * 500)); 
 
-                bufferAccumulator = new Uint8Array(0); // Reset
+                const chunkToSend = pcmBuffer.slice(0, BUFFER_SIZE);
+                pcmBuffer = pcmBuffer.slice(BUFFER_SIZE);
                 
-                // Fire and forget send
-                try {
-                     await fetch(`${API_BASE_URL}/consults/${consultId}/voice-send`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/octet-stream' },
-                        body: toSend as any
+                // Only upload if server is ready
+                if (serverReadyRef.current) {
+                    setDebugLog(`Uploading ${chunkToSend.length} bytes...`);
+                    // Upload chunk SEQUENTIALLY
+                    uploadQueue = uploadQueue.then(() => 
+                        fetch(`${API_BASE_URL}/consults/${consultId}/voice-send`, {
+                            method: 'POST',
+                            body: chunkToSend,
+                            headers: { 'Content-Type': 'application/octet-stream' }
+                        }).then(res => {
+                            if (!res.ok) {
+                                setDebugLog(`Upload FAIL: ${res.status}`);
+                                console.warn(`[VoiceConsole] Upload failed: ${res.status}`);
+                            } else {
+                                setDebugLog(`Upload OK: ${res.status} [${Date.now() % 10000}]`);
+                            }
+                        })
+                    ).catch(e => {
+                        setDebugLog(`Upload ERR: ${e.message}`);
+                        console.warn("[VoiceConsole] Upload error", e);
                     });
-                } catch(err) {
-                    console.warn("Error sending chunk", err);
+                } else {
+                    setDebugLog(`Buffering (Wait Ready)... ${pcmBuffer.length}/${BUFFER_SIZE}`);
                 }
             }
         };
+  };
 
-        // 4. Start Listening (Downlink)
-        // Ensure this is open BEFORE we start sending? 
+  const connectDownlink = async (ctx: AudioContext) => {
+        // 4. Start Listen Stream (Downlink)
         const listenUrl = `${API_BASE_URL}/consults/${consultId}/voice-listen`;
-        console.log(`[VoiceConsole] Listening on: ${listenUrl}`);
+        console.log(`[VoiceConsole] Connecting to downlink: ${listenUrl}`);
         
-        // Optimistically set Live so Mic works immediately
         setStatus('live');
 
-        // Execute Listen in background (don't await) to prevent UI blocking
+        // Execute Listen in background
         const listenUrlParams = listenUrl + '?_t=' + Date.now();
+        
+        // Safety Fallback: If connect hangs, enable upload anyway after 2 seconds
+        // (Reduced from 6s to help with buffering issues)
+        setTimeout(() => {
+            if (!serverReadyRef.current) {
+                console.log("[VoiceConsole] Force-enabling uploads (Timeout Fallback)");
+                serverReadyRef.current = true; // FORCE ENABLE
+            }
+        }, 2000);
+
         fetch(listenUrlParams).then(async (response) => {
-            console.log(`[VoiceConsole] Listen status: ${response.status}`);
+            console.log(`[VoiceConsole] Downlink connected. Status: ${response.status}`);
+            
+            // DEBUG: Bypass Ready Wait
+            console.log("[VoiceConsole] Auto-enabling uploads (DEBUG BYPASS)");
+            serverReadyRef.current = true;
+
             if (!response.ok) {
+                 const txt = await response.text();
+                 console.error(`[VoiceConsole] Downlink failed: ${txt}`);
+                 alert(`Connection Failed: ${response.status} ${response.statusText}\n${txt}`);
                  throw new Error("Failed to connect down-link");
             }
 
-            // 5. Handle Streaming Response
+            // 5. Handle NDJSON Streaming Response
             if (response.body) {
-                console.log("[VoiceConsole] Reading response stream...");
+                console.log("[VoiceConsole] Reading NDJSON stream...");
                 const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let totalBytes = 0;
+
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) {
-                        console.log("[VoiceConsole] Stream complete");
+                        console.log(`[VoiceConsole] Stream ended. Total bytes: ${totalBytes}`);
                         break;
                     }
-                    if (isPendingStopRef.current) break;
-                    
+                    if (isPendingStopRef.current) {
+                        console.log("[VoiceConsole] Stream reading stopped by client.");
+                        break;
+                    }
+
                     if (value) {
-                         console.log(`[VoiceConsole] Chunk received: ${value.byteLength} bytes`);
-                        playAudioChunk(value, ctx);
+                        totalBytes += value.byteLength;
+                        // Log first few chunks or periodically
+                        if (totalBytes < 1000000) {
+                             console.log(`[VoiceConsole] RX Chunk: ${value.byteLength} bytes. Total: ${totalBytes}`);
+                        }
+                    }
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || ''; // Keep incomplete line
+
+                    for (let line of lines) {
+                        line = line.trim();
+                        if (!line) continue;
+                        
+                        // Parse SSE Data Format "data: {...}"
+                        if (line.startsWith("data: ")) {
+                            line = line.substring(6).trim();
+                        } else if (line.startsWith(":")) {
+                            // Comment (keep-alive)
+                            continue;
+                        }
+
+                        // Debug: if line is just "ready", ignore valid JSON check
+                        // But backend sends JSON stringified inside data
+                        
+                        try {
+                            const msg = JSON.parse(line);
+                            setRxCount(c => c + 1); // Increment counter
+                            
+                            if (msg.t === 'audio' && msg.d) {
+                                // Audio Packet
+                                playAudioChunk(base64ToUint8Array(msg.d), ctx, msg.s || 0);
+                            } 
+                            else if (msg.t === 'clear') {
+                                // Barge-in Stop Signal
+                                setDebugLog("RX: CLEAR SIGNAL");
+                                stopPlayback(ctx);
+                            }
+                            else if (msg.t === 'ready') {
+                                setDebugLog("RX: READY SIGNAL");
+                                serverReadyRef.current = true;
+                            }
+                            else if (msg.t === 'ping') {
+                                // Heartbeat - keep alive
+                                setDebugLog("RX: PING (Heartbeat)");
+                                // Do NOT allow heartbeat to reset silence/timeouts if we implement them later
+                            } else {
+                                console.log("[VoiceConsole] Received unknown message:", msg);
+                            }
+
+                        } catch (e) {
+                             console.warn("[VoiceConsole] JSON Parse Error in stream", e);
+                        }
                     }
                 }
             }
-            cleanup();
+            // IF LOOP BREAKS -> RECONNECT?
+            // "Stream ended" usually means server closed connection.
+            // If session is still 'live', we should probably try to reconnect or show status.
+            console.log("[VoiceConsole] Stream Loop Exited");
+            
+            // cleanup(); // DON'T CLEANUP IMMEDIATELY causing "No more AI voice"
+            // If the stream ends naturally (e.g. cloud function timeout), we might need to re-establish
+            // BUT for now, let's just log it. The Function should keep stream open for 60s+
+            
+            if (!isPendingStopRef.current) {
+               console.warn("[VoiceConsole] Stream died unexpectedly. Attempting reconnect...");
+               // For now, just show error to user so they know to toggle
+               setError("Voice connection lost. Please toggle off/on.");
+               setStatus('error');
+            }
+            
         }).catch (err => {
-             console.error("Voice Downlink Error:", err);
+             console.error("[VoiceConsole] Voice Downlink Error:", err);
              setError(err.message || 'Connection lost');
              cleanup();
         });
-
-    } catch (err: any) {
-        console.error(err);
-        setError(err.message || 'Error starting session');
-        cleanup();
-    }
-  };
-
-  const playAudioChunk = (data: Uint8Array, ctx: AudioContext) => {
-      if (ctx.state === 'closed') {
-          console.warn("[VoiceConsole] Context is closed, skipping chunk play");
-          return;
-      }
-      if (ctx.state === 'suspended') {
-          ctx.resume().catch(e => console.warn("Resume failed", e));
-      }
-
-      // Check for HTML error response disguised as audio
-      if (data.length > 0 && data[0] === 60) { // '<' character
-          const text = new TextDecoder().decode(data.slice(0, 100));
-          if (text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html')) {
-              console.error("[VoiceConsole] Received HTML instead of Audio:", text);
-              return;
-          }
-      }
-
-      console.log(`[VoiceConsole] Received audio chunk: ${data.byteLength} bytes`);
-
-      // Decode Int16 -> Float32
-      // Copy to ensure alignment and prevent RangeError if byteOffset is odd
-      const bufferCopy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-      const int16 = new Int16Array(bufferCopy);
-      
-      const float32 = new Float32Array(int16.length);
-      let sumSq = 0;
-      for (let i = 0; i < int16.length; i++) {
-          float32[i] = int16[i] / 32768.0;
-          sumSq += float32[i] * float32[i];
-      }
-      
-      const rms = Math.sqrt(sumSq / int16.length);
-      if (rms > 0.01) {
-        console.log(`[VoiceConsole] Playing chunk: ${data.byteLength} bytes, RMS: ${rms.toFixed(4)}`);
-      }
-      // Update visual volume (decay handled by react re-renders or next chunk)
-      setIncomingVolume(Math.min(100, rms * 500)); // Amplify for display
-
-      try {
-        const buffer = ctx.createBuffer(1, float32.length, 24000);
-        buffer.getChannelData(0).set(float32);
-
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-
-        const now = ctx.currentTime;
-        // Schedule playback
-        const startTime = Math.max(now, nextStartTimeRef.current);
-        src.start(startTime);
-        nextStartTimeRef.current = startTime + buffer.duration;
-      } catch (e) {
-          console.warn("[VoiceConsole] Playback error:", e);
-      }
-  };
-
-  const stopSession = () => {
-      cleanup();
-  };
-
-  const testAudioOutput = async () => {
-    try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        
-        osc.frequency.value = 440; // A4
-        gain.gain.value = 0.1;
-        
-        osc.start();
-        setTimeout(() => {
-            osc.stop();
-            ctx.close();
-        }, 500);
-    } catch (e) {
-        alert("Audio Output Failed: " + String(e));
-    }
   };
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <div className="flex items-center gap-4">
-        {/* Status Indicator */}
-        <div className={`relative flex h-12 w-12 items-center justify-center rounded-full border transition-all duration-500 ${
-            status === 'live' 
-            ? 'border-red-500/50 bg-red-500/10 shadow-[0_0_20px_rgba(239,68,68,0.3)]' 
-            : status === 'connecting'
-                ? 'border-yellow-400/50 bg-yellow-400/10 animate-pulse'
-                : 'border-white/10 bg-white/5'
-        }`}>
-            {status === 'live' ? (
-                <div className="flex gap-0.5">
-                    <div className="h-4 w-1 animate-[music_1s_ease-in-out_infinite] bg-red-500"></div>
-                    <div className="h-6 w-1 animate-[music_1.2s_ease-in-out_infinite] bg-red-500 delay-75"></div>
-                    <div className="h-3 w-1 animate-[music_0.8s_ease-in-out_infinite] bg-red-500 delay-150"></div>
-                </div>
-            ) : (
-                <svg className={`h-5 w-5 ${status === 'connecting' ? 'text-yellow-400' : 'text-slate-500'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                </svg>
-            )}
-        </div>
-
-        <div>
-            <h3 className="text-sm font-semibold text-white">Live Voice Channel</h3>
-            <div className="text-xs text-slate-400 flex items-center gap-4">
-                {status === 'idle' && (consultId ? 'Ready to connect' : 'Select a patient case')}
-                {status === 'connecting' && 'Establishing secure uplink...'}
-                {status === 'live' && (
-                  <>
-                  <span className="text-red-400 flex items-center gap-2">
-                    ● ACTIVE
-                  </span>
-                  
-                   {/* Mic Volume */}
-                   <div className="flex items-center gap-2" title="Microphone Input Level">
-                        <svg className={`h-3 w-3 ${micVolume > 5 ? 'text-white' : 'text-slate-600'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
-                        <span className="block h-1.5 w-12 overflow-hidden rounded-full bg-slate-800">
-                             <span 
-                                className="block h-full bg-white transition-all duration-100 ease-out"
-                                style={{ width: `${micVolume}%` }}
-                             ></span>
-                        </span>
-                   </div>
-
-                   {/* Rx Volume */}
-                   <div className="flex items-center gap-2" title="Incoming Voice Level">
-                        <svg className={`h-3 w-3 ${incomingVolume > 5 ? 'text-green-400' : 'text-slate-600'}`} fill="currentColor" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
-                        <span className="block h-1.5 w-12 overflow-hidden rounded-full bg-slate-800">
-                            <span 
-                                className="block h-full bg-green-500 transition-all duration-100 ease-out"
-                                style={{ width: `${incomingVolume}%` }}
-                            ></span>
-                        </span>
-                   </div>
-                   </>
-                )}
-                {error && <span className="text-red-400">{error}</span>}
-            </div>
+    <div className="p-3 bg-white/5 border border-white/10 rounded-xl backdrop-blur-md transition-all">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-medium text-slate-200 flex items-center gap-2 text-sm">
+            {/* Custom AI "Loop" Icon resembling a copilot assistant */}
+            <svg className="w-5 h-5" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 4C7.58172 4 4 7.58172 4 12C4 16.4183 7.58172 20 12 20" stroke="#38bdf8" strokeWidth="2.5" strokeLinecap="round" />
+                <path d="M12 4C16.4183 4 20 7.58172 20 12C20 15 18 18 16 19" stroke="#818cf8" strokeWidth="2.5" strokeLinecap="round" />
+                <circle cx="12" cy="12" r="2" fill="#38bdf8" />
+            </svg>
+            Copilot
+            {status === 'live' && <span className="flex h-2.5 w-2.5 relative">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-red-500"></span>
+            </span>}
+        </h3>
+        <div className="text-xs font-medium">
+            {isOffline && <span className="text-red-500 font-bold">OFFLINE</span>}
+            {!isOffline && status === 'idle' && <span className="text-slate-500">Ready</span>}
+            {!isOffline && status === 'connecting' && <span className="text-yellow-500">Connecting...</span>}
+            {!isOffline && status === 'live' && <span className="text-green-400">LIVE</span>}
+            {!isOffline && status === 'error' && <span className="text-red-400">Error</span>}
         </div>
       </div>
 
-      <div className="flex items-center gap-4">
-         <button 
-            onClick={testAudioOutput}
-            className="text-xs text-slate-500 hover:text-white underline decoration-dashed"
-         >
-            Test Spk
-         </button>
+      {error && (
+        <div className="mb-3 p-2 bg-red-500/10 text-red-200 text-xs rounded border border-red-500/20">
+            {error}
+        </div>
+      )}
 
-         {status === 'live' && (
-             <div className="hidden items-center gap-2 text-xs font-mono text-slate-500 md:flex">
-                <span>24kHz</span>
-                <span className="text-slate-700">|</span>
-                <span>PCM-16</span>
-             </div>
-         )}
-         
-         {!consultId ? (
-             <button disabled className="rounded-lg bg-white/5 px-6 py-2.5 text-sm font-semibold text-slate-500 cursor-not-allowed">
-                Select Case
-             </button>
-         ) : status === 'live' ? (
-            <button
-                onClick={stopSession}
-                className="group relative flex items-center gap-2 overflow-hidden rounded-lg bg-red-500/10 px-6 py-2.5 text-sm font-semibold text-red-500 transition-all hover:bg-red-500 hover:text-white"
-            >
-                <span className="relative z-10">End Session</span>
-            </button>
-         ) : (
+      {/* Visualizers */}
+      <div className="flex gap-3 mb-4">
+          <div className="flex-1">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Microphone</div>
+              <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-blue-500 transition-all duration-75 shadow-[0_0_8px_rgba(59,130,246,0.6)]"
+                    style={{ width: `${Math.min(100, micVolume)}%` }}
+                  />
+              </div>
+          </div>
+          <div className="flex-1">
+              <div className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Incoming</div>
+              <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-green-500 transition-all duration-75 shadow-[0_0_8px_rgba(34,197,94,0.6)]"
+                    style={{ width: `${Math.min(100, incomingVolume)}%` }}
+                  />
+              </div>
+          </div>
+      </div>
+
+      <div className="flex justify-center">
+        {status === 'idle' || status === 'error' || isOffline ? (
             <button
                 onClick={startSession}
-                disabled={status === 'connecting'}
-                className="group relative flex items-center gap-2 overflow-hidden rounded-lg bg-blue-600 px-6 py-2.5 text-sm font-semibold text-white shadow-lg shadow-blue-500/20 transition-all hover:bg-blue-500 hover:scale-105 active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
+                disabled={!consultId || isOffline}
+                className={`font-medium py-1.5 px-5 rounded-full shadow-lg hover:shadow-xl transition-all flex items-center gap-2 text-sm ${
+                    !consultId || isOffline
+                    ? 'bg-slate-700/50 cursor-not-allowed text-slate-500' 
+                    : 'bg-blue-600 hover:bg-blue-500 text-white hover:scale-105'
+                }`}
+                title={isOffline ? "System is offline" : (!consultId ? "Select a consultation from the list above to start" : "Start Voice Session")}
             >
-                <span className="relative z-10">
-                    {status === 'connecting' ? 'Connecting...' : 'Start Session'}
-                </span>
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path></svg>
+                {consultId ? "Start Session" : "Select Consult"}
             </button>
-         )}
+        ) : (
+            <button
+                onClick={cleanup}
+                className="bg-red-500/80 hover:bg-red-500 text-white font-medium py-1.5 px-5 rounded-full shadow-lg hover:shadow-red-500/20 transition-all flex items-center gap-2 text-sm hover:scale-105"
+            >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                End Session
+            </button>
+        )}
       </div>
+
+      <div className="mt-3 flex justify-between items-center px-1">
+        <span className="text-[10px] text-slate-600">Azure AI VoiceLive • 24kHz</span>
+        
+        <div className="flex items-center gap-3">
+            <button onClick={testAudio} className="text-slate-500 hover:text-blue-400 text-[10px] transition-colors">Test Tone</button>
+            <button 
+                onClick={() => setShowDebug(!showDebug)} 
+                className="text-slate-600 hover:text-slate-400 text-[10px] flex items-center gap-1 focus:outline-none transition-colors"
+            >
+                {showDebug ? 'Hide' : 'Debug'} 
+                <svg className={`w-3 h-3 transform transition-transform ${showDebug ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+            </button>
+        </div>
+      </div>
+
+      {showDebug && (
+       <div className="mt-2 text-[10px] font-mono bg-black/40 p-2 border border-white/5 rounded text-slate-400 break-all animate-in fade-in slide-in-from-top-1 duration-200 shadow-inner">
+          <div className="flex justify-between border-b border-white/5 mb-1 pb-1">
+            <span>RX Chunks: {rxCount}</span>
+            <span className={status === 'live' ? 'text-green-500' : 'text-slate-500'}>{status}</span>
+          </div>
+          <div className="opacity-80">{debugLog}</div>
+      </div>
+      )}
     </div>
   );
 }

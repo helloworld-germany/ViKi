@@ -23,6 +23,7 @@
 - Next.js frontend today consumes mock data (see `frontend/portal/lib/mockData.ts`).
 - Planned API: REST or GraphQL endpoint that streams consult packages, attachments (SAS URLs), and AI reasoning traces.
 - Voice surface integrates Azure Speech SDK + GPT to provide hands-free summaries and clarifications.
+  - **See [Voice Subsystem Architecture](voice_subsystem.md)** for details on the custom Jitter Buffer and AudioWorklet implementation.
 
 ## Identity & Data Flow
 1. Hospital physician sends consult through NetSfere.

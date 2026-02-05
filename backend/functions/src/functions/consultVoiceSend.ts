@@ -1,14 +1,24 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { SessionManager } from '../lib/voiceSessionManager';
-import { sendAudioInput } from '../lib/voiceliveclient';
+import { sendAudioInput, logToDebug } from '../lib/voiceliveclient';
+import { logToApp } from '../lib/logger';
+
+function logVoiceSend(msg: string) {
+    logToApp('VoiceSend', msg);
+}
 
 export async function handler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
     const id = request.params?.id;
+    logVoiceSend(`Hit handler for ${id}`); 
+    
     if (!id) return { status: 400, jsonBody: { error: 'Missing consult id' } };
 
     try {
-        const active = SessionManager.get(id);
+        // Wait for session to be active (handles pending state during connection)
+        const active = await SessionManager.waitForSession(id, 10000); // 10s timeout
+        
         if (!active) {
+            logVoiceSend(`No active session found for ${id} after wait. Available: ${SessionManager.listKeys().join(', ')}`);
             return { status: 404, jsonBody: { error: 'No active session. Connect to voice-listen first.' } };
         }
 
@@ -42,10 +52,12 @@ export async function handler(request: HttpRequest, context: InvocationContext):
 
         if (audioData.byteLength > 0) {
             context.log(`[VoiceSend] Received ${audioData.byteLength} bytes. Sending to session...`);
+            logToDebug(`[VoiceSend] Received ${audioData.byteLength} bytes for consult ${id}. Sending to VoiceLive...`);
             // Send to session
             await sendAudioInput(active.session, audioData);
         } else {
             context.warn(`[VoiceSend] Received empty body.`);
+            logToDebug(`[VoiceSend] Received empty body for consult ${id}.`);
         }
 
         return { status: 200 };

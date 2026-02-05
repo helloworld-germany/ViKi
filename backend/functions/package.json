@@ -8,7 +8,7 @@
     "build": "rimraf dist && tsc -p tsconfig.json",
     "lint": "eslint src --ext .ts",
     "prestart": "npm run build",
-    "start": "concurrently \"azurite --silent --location ../../ --debug ../../debug.log\" \"func start\"",
+    "start": "concurrently \"azurite --silent --location ../../ --debug ../../log/debug.log\" \"func start\"",
     "dev": "npm run build -- --watch"
   },
   "dependencies": {
@@ -26,6 +26,7 @@
     "@typescript-eslint/parser": "6.21.0",
     "azure-functions-core-tools": "4.6.0",
     "azurite": "3.35.0",
+    "concurrently": "^9.2.1",
     "eslint": "8.56.0",
     "rimraf": "5.0.5",
     "typescript": "5.4.3"
