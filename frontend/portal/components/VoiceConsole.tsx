@@ -111,6 +111,17 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animationFrameRef = useRef<number | null>(null);
 
+  // Noise Floor Calibration Refs
+  const noiseFloorRef = useRef<number>(0.001); // Default noise floor (will be calibrated)
+  const calibrationSamplesRef = useRef<number[]>([]); // Collect samples for calibration
+  const isCalibrationDoneRef = useRef<boolean>(false);
+  const dcOffsetRef = useRef<number>(0); // Track DC offset for high-pass filter
+
+  // Session Management Refs (for clean restart)
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const sessionIdRef = useRef<number>(0); // Increment on each start to ignore stale events
+  const downlinkReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+
   const stopPlayback = useCallback((ctx: AudioContext) => {
     console.log("[VoiceConsole] Interrupt! Stopping playback (Barge-in)");
     
@@ -134,6 +145,20 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
 
   const cleanup = useCallback(() => {
     isPendingStopRef.current = true;
+    
+    // Abort downlink fetch and cancel reader to prevent stale error messages
+    if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+    }
+    if (downlinkReaderRef.current) {
+        downlinkReaderRef.current.cancel().catch(() => {});
+        downlinkReaderRef.current = null;
+    }
+    
+    // Reset session-scoped refs
+    serverReadyRef.current = false;
+    earlyChunkQueueRef.current = [];
     
     if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
@@ -307,6 +332,15 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
     setError(null);
     isPendingStopRef.current = false;
     activeSourcesRef.current = [];
+    
+    // Increment session ID to invalidate any stale downlink handlers
+    sessionIdRef.current += 1;
+    const currentSessionId = sessionIdRef.current;
+    console.log(`[VoiceConsole] Session ID: ${currentSessionId}`);
+    
+    // Reset server ready state for new session
+    serverReadyRef.current = false;
+    earlyChunkQueueRef.current = [];
 
 
     try {
@@ -401,7 +435,7 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         await startMic(ctx);
 
         // Start Downlink (Non-blocking await? No, we await connection init but stream is async)
-        await connectDownlink(ctx);
+        await connectDownlink(ctx, currentSessionId);
         
     } catch (err: any) {
         console.error("[VoiceConsole] Session Error:", err);
@@ -453,11 +487,27 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         const SAMPLE_RATE = 24000; 
         const BYTES_PER_SAMPLE = 2; // Int16
         const BUFFER_SIZE = (SAMPLE_RATE * CHUNK_SIZE_MS) / 1000 * BYTES_PER_SAMPLE; 
-        const DIGITAL_GAIN = 3.0; // Reduced from 5.0 for cleaner signal to VoiceLive
-        const PRE_AMP = 1.0;
+        const BASE_GAIN = 3.0; // Increased base gain for stronger VoiceLive input
+        const MIN_GAIN = 1.5; // Raised minimum to ensure audible signal
+        const MAX_GAIN = 6.0; // Allow higher gain for quiet mics
+        const TARGET_RMS = 0.10; // Higher target RMS for better VoiceLive recognition
+        let adaptiveGain = BASE_GAIN;
         
         // Soft limiter function (tanh-based) - preserves dynamics without harsh clipping
         const softLimit = (x: number) => Math.tanh(x * 1.5) / Math.tanh(1.5);
+        
+        // High-pass filter coefficient (removes DC offset and very low frequencies)
+        const HP_ALPHA = 0.997; // Slightly higher to preserve low-frequency energy (~20Hz cutoff)
+        let hpPrevInput = 0;
+        let hpPrevOutput = 0;
+        
+        // Reset calibration for new session
+        isCalibrationDoneRef.current = false;
+        calibrationSamplesRef.current = [];
+        noiseFloorRef.current = 0.001;
+        dcOffsetRef.current = 0;
+        const CALIBRATION_DURATION_MS = 2000; // Calibrate noise floor for first 2 seconds
+        const calibrationStartTime = Date.now();
 
         let pcmBuffer = new Uint8Array(0);
         let uploadQueue = Promise.resolve();
@@ -467,15 +517,41 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
             // Float32 -> Int16 conversion
             const float32 = new Float32Array(event.data);
             
-            // Adaptive Noise Gate with attack/release to avoid choppy speech
-            let sumSq = 0;
-            for(let i=0; i<float32.length; i++) {
-                sumSq += float32[i] * float32[i];
+            // Apply high-pass filter to remove DC offset (prevents stuck meter)
+            const filtered = new Float32Array(float32.length);
+            for (let i = 0; i < float32.length; i++) {
+                // DC-blocking high-pass filter: y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+                const input = float32[i];
+                hpPrevOutput = HP_ALPHA * (hpPrevOutput + input - hpPrevInput);
+                hpPrevInput = input;
+                filtered[i] = hpPrevOutput;
             }
-            const rms = Math.sqrt(sumSq / float32.length);
             
-            // Adaptive threshold: Very low to avoid cutting speech
-            const NOISE_GATE_THRESHOLD = 0.001; // Lowered further
+            // Calculate RMS from FILTERED signal
+            let sumSq = 0;
+            for (let i = 0; i < filtered.length; i++) {
+                sumSq += filtered[i] * filtered[i];
+            }
+            const rms = Math.sqrt(sumSq / filtered.length);
+            
+            // Noise floor calibration during first 2 seconds
+            const timeSinceStart = Date.now() - calibrationStartTime;
+            if (!isCalibrationDoneRef.current && timeSinceStart < CALIBRATION_DURATION_MS) {
+                calibrationSamplesRef.current.push(rms);
+                if (calibrationSamplesRef.current.length > 5) {
+                    // Use 20th percentile with reduced margin (less aggressive gating)
+                    const sorted = [...calibrationSamplesRef.current].sort((a, b) => a - b);
+                    noiseFloorRef.current = sorted[Math.floor(sorted.length * 0.2)] * 1.2; // 20th percentile + small margin
+                }
+                setDebugLog(`Calibrating... ${Math.ceil((CALIBRATION_DURATION_MS - timeSinceStart) / 1000)}s`);
+            } else if (!isCalibrationDoneRef.current) {
+                isCalibrationDoneRef.current = true;
+                console.log(`[VoiceConsole] Noise floor calibrated: ${noiseFloorRef.current.toFixed(5)}`);
+                setDebugLog(`Noise floor: ${noiseFloorRef.current.toFixed(5)}`);
+            }
+            
+            // Relaxed noise gate threshold (1.0x noise floor instead of 1.2x)
+            const NOISE_GATE_THRESHOLD = Math.max(0.0005, noiseFloorRef.current * 1.0);
             const isSilence = rms < NOISE_GATE_THRESHOLD;
             
             // Note: Attack/release should be implemented in a stateful manner
@@ -488,16 +564,21 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
                 stopPlayback(audioContextRef.current);
             }
 
-            // Debug RMS occasionally
-            if (Math.random() < 0.05) {
-                 // setDebugLog(`RMS: ${rms.toFixed(5)} Gate: ${isSilence ? 'ON' : 'OFF'}`);
+            // Adaptive gain: adjust gain to target RMS when speech is detected
+            if (!isSilence && isCalibrationDoneRef.current) {
+                const adjustedRms = Math.max(0, rms - noiseFloorRef.current);
+                if (adjustedRms > 0.002) { // Lower threshold to allow gain increase for quiet mics
+                    const targetGain = TARGET_RMS / adjustedRms;
+                    // Faster adaptation (0.15 blend) for more responsive gain
+                    adaptiveGain = adaptiveGain * 0.85 + Math.min(MAX_GAIN, Math.max(MIN_GAIN, targetGain)) * 0.15;
+                }
             }
 
-            const int16 = new Int16Array(float32.length);
-            for (let i = 0; i < float32.length; i++) {
-                // Apply gain with SOFT LIMITER (no hard clipping)
-                const sample = isSilence ? 0 : float32[i];
-                const amplified = sample * DIGITAL_GAIN * PRE_AMP;
+            const int16 = new Int16Array(filtered.length);
+            for (let i = 0; i < filtered.length; i++) {
+                // Apply adaptive gain with SOFT LIMITER (no hard clipping)
+                const sample = isSilence ? 0 : filtered[i];
+                const amplified = sample * adaptiveGain;
                 const limited = softLimit(amplified); // Soft limit instead of hard clamp
                 int16[i] = limited < 0 ? limited * 0x8000 : limited * 0x7FFF;
             }
@@ -507,17 +588,11 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
             newBuffer.set(new Uint8Array(int16.buffer), pcmBuffer.length);
             pcmBuffer = newBuffer;
 
-            // Visual Mic Volume - compute from POST-GAIN signal for accuracy
-            // This shows what VoiceLive actually receives
-            let postGainSumSq = 0;
-            for (let i = 0; i < int16.length; i++) {
-                const normalized = int16[i] / 32768.0;
-                postGainSumSq += normalized * normalized;
-            }
-            const postGainRms = Math.sqrt(postGainSumSq / int16.length);
-            const METER_GAIN = 150.0; // Calibrated for natural response
-            const meterValue = isSilence ? 0 : (postGainRms * METER_GAIN * 100);
-            setMicVolume(v => v * 0.7 + meterValue * 0.3); // Smoother with 70/30 blend
+            // Visual Mic Volume - compute from noise-floor-adjusted RMS
+            // Subtract noise floor for accurate meter (prevents stuck-high meter)
+            const adjustedRms = Math.max(0, rms - noiseFloorRef.current);
+            const normalizedMeter = isSilence ? 0 : Math.min(100, adjustedRms * 800); // Scale 0-100
+            setMicVolume(v => v * 0.8 + normalizedMeter * 0.2); // Smooth with 80/20 blend
 
             if (pcmBuffer.length >= BUFFER_SIZE) {
                 // FIX: Don't drop data while waiting for connection
@@ -561,12 +636,16 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         };
   };
 
-  const connectDownlink = async (ctx: AudioContext) => {
+  const connectDownlink = async (ctx: AudioContext, sessionId: number) => {
         // 4. Start Listen Stream (Downlink)
         const listenUrl = `${API_BASE_URL}/consults/${consultId}/voice-listen`;
-        console.log(`[VoiceConsole] Connecting to downlink: ${listenUrl}`);
+        console.log(`[VoiceConsole] Connecting to downlink: ${listenUrl} (Session ${sessionId})`);
         
         setStatus('live');
+
+        // Create AbortController for this session
+        const abortController = new AbortController();
+        abortControllerRef.current = abortController;
 
         // Execute Listen in background
         const listenUrlParams = listenUrl + '?_t=' + Date.now();
@@ -574,13 +653,13 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         // Safety Fallback: If connect hangs, enable upload anyway after 2 seconds
         // (Reduced from 6s to help with buffering issues)
         setTimeout(() => {
-            if (!serverReadyRef.current) {
+            if (!serverReadyRef.current && sessionIdRef.current === sessionId) {
                 console.log("[VoiceConsole] Force-enabling uploads (Timeout Fallback)");
                 serverReadyRef.current = true; // FORCE ENABLE
             }
         }, 2000);
 
-        fetch(listenUrlParams).then(async (response) => {
+        fetch(listenUrlParams, { signal: abortController.signal }).then(async (response) => {
             console.log(`[VoiceConsole] Downlink connected. Status: ${response.status}`);
             
             // DEBUG: Bypass Ready Wait
@@ -594,10 +673,17 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
                  throw new Error("Failed to connect down-link");
             }
 
+            // Check if session is still valid (user may have stopped during connection)
+            if (sessionIdRef.current !== sessionId) {
+                console.log(`[VoiceConsole] Session ${sessionId} superseded by ${sessionIdRef.current}, ignoring.`);
+                return;
+            }
+
             // 5. Handle NDJSON Streaming Response
             if (response.body) {
                 console.log("[VoiceConsole] Reading NDJSON stream...");
                 const reader = response.body.getReader();
+                downlinkReaderRef.current = reader; // Store for cleanup
                 const decoder = new TextDecoder();
                 let buffer = '';
                 let totalBytes = 0;
@@ -674,23 +760,31 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
             // IF LOOP BREAKS -> RECONNECT?
             // "Stream ended" usually means server closed connection.
             // If session is still 'live', we should probably try to reconnect or show status.
-            console.log("[VoiceConsole] Stream Loop Exited");
+            console.log(`[VoiceConsole] Stream Loop Exited (Session ${sessionId})`);
             
-            // cleanup(); // DON'T CLEANUP IMMEDIATELY causing "No more AI voice"
-            // If the stream ends naturally (e.g. cloud function timeout), we might need to re-establish
-            // BUT for now, let's just log it. The Function should keep stream open for 60s+
-            
-            if (!isPendingStopRef.current) {
+            // Only show error if this is still the active session and not a user-initiated stop
+            if (!isPendingStopRef.current && sessionIdRef.current === sessionId) {
                console.warn("[VoiceConsole] Stream died unexpectedly. Attempting reconnect...");
-               // For now, just show error to user so they know to toggle
                setError("Voice connection lost. Please toggle off/on.");
                setStatus('error');
+            } else {
+               console.log(`[VoiceConsole] Ignoring stream end for stale session ${sessionId} (current: ${sessionIdRef.current})`);
             }
             
         }).catch (err => {
-             console.error("[VoiceConsole] Voice Downlink Error:", err);
-             setError(err.message || 'Connection lost');
-             cleanup();
+             // Ignore AbortError (expected when user stops session)
+             if (err.name === 'AbortError') {
+                 console.log(`[VoiceConsole] Downlink aborted for session ${sessionId} (expected).`);
+                 return;
+             }
+             // Only set error if this is still the active session
+             if (sessionIdRef.current === sessionId) {
+                 console.error("[VoiceConsole] Voice Downlink Error:", err);
+                 setError(err.message || 'Connection lost');
+                 cleanup();
+             } else {
+                 console.log(`[VoiceConsole] Ignoring downlink error for stale session ${sessionId}`);
+             }
         });
   };
 
