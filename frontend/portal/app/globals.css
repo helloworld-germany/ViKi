@@ -1,22 +1,66 @@
 :root {
-  --bg: #0b1221;
-  --card: #111b31;
-  --accent: #00b4d8;
-  --text: #e5f2ff;
-  --muted: #94a3b8;
+  --bg: #030713;
+  --bg-alt: #070e20;
+  --surface: rgba(12, 20, 41, 0.92);
+  --surface-alt: rgba(18, 33, 70, 0.75);
+  --border: #1f2f57;
+  --accent: #74a8ff;
+  --accent-strong: #3c7bff;
+  --text: #f4f8ff;
+  --muted: #94a3c7;
 }
 
-html, body {
-  background: radial-gradient(circle at top, #12203f, #050914 60%);
-  color: var(--text);
-  font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
+html,
+body {
   min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at 10% 20%, rgba(22, 58, 135, 0.25), transparent 55%),
+    radial-gradient(circle at 85% 0%, rgba(56, 109, 255, 0.18), transparent 45%),
+    linear-gradient(140deg, #030712 0%, #050914 40%, #07102b 100%);
+  color: var(--text);
+  font-family: 'Segoe UI Variable', 'Segoe UI', 'Space Grotesk', sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
 }
 
 * {
   box-sizing: border-box;
 }
 
+::selection {
+  background: rgba(91, 142, 252, 0.8);
+  color: #fff;
+}
+
 a {
   color: var(--accent);
+}
+
+p,
+h1,
+h2,
+h3,
+ul,
+li,
+figure {
+  margin: 0;
+  padding: 0;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  background: none;
+  color: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+main {
+  width: 100%;
 }

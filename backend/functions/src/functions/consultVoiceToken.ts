@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { getConsult } from '../lib/consultRepository';
-import { createVoiceLiveSession } from '../lib/voiceLiveClient';
+import { createVoiceLiveTicket } from '../lib/voiceLiveClient';
 
 async function handler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   const id = request.params?.id;
@@ -21,24 +21,24 @@ async function handler(request: HttpRequest, context: InvocationContext): Promis
       };
     }
 
-    const session = await createVoiceLiveSession(consult);
+    const ticket = await createVoiceLiveTicket(consult);
 
     return {
       status: 200,
-      jsonBody: session
+      jsonBody: ticket
     };
   } catch (error) {
-    context.error(`Failed to create realtime session for consult ${id}`, error);
+    context.error(`Failed to issue Voice Live ticket for consult ${id}`, error);
     return {
       status: 500,
-      jsonBody: { error: 'Unable to create realtime session' }
+      jsonBody: { error: 'Unable to create Voice Live ticket' }
     };
   }
 }
 
-app.http('consult-voice-token', {
+app.http('consult-voice-ticket', {
   methods: ['POST'],
   authLevel: 'anonymous',
-  route: 'consults/{id}/voice-token',
+  route: 'consults/{id}/voice-ticket',
   handler
 });

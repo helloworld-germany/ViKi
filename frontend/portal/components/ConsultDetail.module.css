@@ -1,0 +1,220 @@
+.card {
+  background: rgba(9, 14, 32, 0.95);
+  border: 1px solid rgba(33, 52, 99, 0.85);
+  border-radius: 30px;
+  padding: 2rem;
+  box-shadow: 0 35px 70px rgba(3, 6, 18, 0.75);
+}
+
+.header {
+  border-bottom: 1px solid rgba(35, 57, 110, 0.75);
+  padding-bottom: 1.5rem;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.45em;
+  font-size: 0.65rem;
+  color: rgba(158, 176, 220, 0.8);
+}
+
+.titleRow {
+  margin-top: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.title {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 2.6rem);
+  font-weight: 600;
+}
+
+.typeBadge {
+  border-radius: 999px;
+  padding: 0.4rem 1rem;
+  border: 1px solid transparent;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.25em;
+}
+
+.typeText {
+  background: rgba(90, 121, 255, 0.12);
+  border-color: rgba(90, 121, 255, 0.5);
+  color: #cfd7ff;
+}
+
+.typeImage {
+  background: rgba(79, 178, 134, 0.12);
+  border-color: rgba(88, 214, 160, 0.45);
+  color: #d4ffef;
+}
+
+.typeFile {
+  background: rgba(255, 186, 120, 0.17);
+  border-color: rgba(255, 186, 120, 0.5);
+  color: #ffe6cf;
+}
+
+.metaGrid {
+  margin-top: 1.5rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1rem;
+}
+
+.metaTile {
+  background: rgba(6, 12, 26, 0.9);
+  border: 1px solid rgba(26, 42, 88, 0.8);
+  border-radius: 18px;
+  padding: 1rem;
+}
+
+.metaLabel {
+  text-transform: uppercase;
+  letter-spacing: 0.35em;
+  font-size: 0.65rem;
+  color: rgba(157, 176, 222, 0.85);
+}
+
+.metaValue {
+  margin-top: 0.5rem;
+  font-size: 1rem;
+}
+
+.summaryRow {
+  margin-top: 1.75rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.summaryCard {
+  border-radius: 22px;
+  border: 1px solid rgba(28, 45, 90, 0.9);
+  padding: 1.25rem;
+  background: rgba(13, 20, 41, 0.95);
+}
+
+.aiCard {
+  background: linear-gradient(150deg, rgba(19, 32, 68, 0.95), rgba(10, 15, 32, 0.95));
+  border: 1px solid rgba(88, 134, 255, 0.4);
+}
+
+.aiCopy {
+  margin-top: 0.85rem;
+  font-size: 1rem;
+  line-height: 1.6;
+  color: #f4f8ff;
+}
+
+.cardTitle {
+  text-transform: uppercase;
+  letter-spacing: 0.4em;
+  font-size: 0.65rem;
+  color: rgba(158, 176, 220, 0.85);
+}
+
+.cardValue {
+  margin-top: 0.85rem;
+  font-size: 1.6rem;
+  font-weight: 600;
+}
+
+.cardHint {
+  margin-top: 0.4rem;
+  color: rgba(149, 167, 213, 0.85);
+  font-size: 0.9rem;
+}
+
+.messagePanel {
+  margin-top: 1.5rem;
+  border-radius: 22px;
+  border: 1px solid rgba(30, 48, 96, 0.85);
+  background: rgba(8, 13, 30, 0.92);
+  padding: 1.5rem;
+}
+
+.messageBody {
+  margin-top: 0.9rem;
+  font-size: 1rem;
+  line-height: 1.6;
+  white-space: pre-line;
+}
+
+.attachment {
+  margin-top: 1.5rem;
+  border-radius: 18px;
+  border: 1px solid rgba(32, 59, 126, 0.65);
+  background: rgba(8, 16, 36, 0.92);
+  padding: 1rem 1.25rem;
+  font-size: 0.95rem;
+}
+
+.threadSection {
+  margin-top: 1.5rem;
+  border-radius: 22px;
+  border: 1px solid rgba(29, 48, 96, 0.7);
+  background: rgba(6, 11, 25, 0.95);
+  padding: 1.25rem;
+}
+
+.threadHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.threadTitle {
+  margin: 0;
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: rgba(158, 176, 220, 0.8);
+}
+
+.threadToggle {
+  border-radius: 999px;
+  border: 1px solid rgba(74, 110, 201, 0.7);
+  padding: 0.35rem 1.2rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #9ab5ff;
+  background: rgba(10, 18, 42, 0.85);
+}
+
+.threadList {
+  margin: 1.25rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.threadItem {
+  border-radius: 18px;
+  border: 1px solid rgba(25, 44, 92, 0.7);
+  padding: 1rem;
+  background: rgba(8, 14, 32, 0.92);
+}
+
+.threadMeta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: rgba(154, 172, 214, 0.85);
+}
+
+.threadText {
+  margin-top: 0.75rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}

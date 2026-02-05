@@ -52,9 +52,14 @@ Create an Azure Voice Live project/agent in the Microsoft Foundry portal, then s
 | `AZURE_VOICELIVE_MODEL` | Voice Live model such as `gpt-realtime` or `gpt-realtime-mini`. |
 | `AZURE_VOICELIVE_VOICE` | Azure Speech voice to render responses (for example `en-US-Ava:DragonHDLatestNeural`). |
 | `AZURE_VOICELIVE_PROJECT_NAME` | Foundry project name tied to the Voice Live resource. |
-| `AZURE_VOICELIVE_API_KEY` | API key (or use a managed identity and omit this field in production). |
+| `AZURE_VOICELIVE_SCOPE` | Optional override for the Entra scope (defaults to `https://voicelive.azure.com/.default`). |
+| `AZURE_VOICELIVE_AGENT_ID` | Optional agent identifier if you are connecting through a Voice Live agent instead of a raw model. |
+| `AZURE_VOICELIVE_API_KEY` | Optional API key fallback. The Functions app prefers Managed Identity/DefaultAzureCredential in production. |
+| `AZURE_CLI_PATH` | Optional path to the Azure CLI executable if `az` is not on your `PATH`. |
 
-These values allow the `/api/consults/{id}/voice-token` endpoint to mint short-lived Voice Live sessions that include the originating NetSfere consult context.
+These values allow the `/api/consults/{id}/voice-ticket` endpoint to mint short-lived Voice Live sessions (using Microsoft Entra tokens) that include the originating NetSfere consult context.
+
+> **Local auth tip:** When no API key is provided, the Function first tries `DefaultAzureCredential` and then automatically shells out to `az account get-access-token --scope https://voicelive.azure.com/.default`. Make sure the Azure CLI is installed, run `az login` in the same terminal before `npm start`, and set `AZURE_CLI_PATH` if the `az` command lives elsewhere.
 
 ## netsfere client sample
 ```powershell

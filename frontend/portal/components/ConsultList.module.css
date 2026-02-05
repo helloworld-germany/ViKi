@@ -1,0 +1,107 @@
+.scrollArea {
+  max-height: 28rem;
+  overflow-y: auto;
+  padding-right: 0.35rem;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.itemButton {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 20px;
+  padding: 1rem 1.1rem;
+  background: rgba(10, 16, 32, 0.85);
+  color: #f4f8ff;
+  text-align: left;
+  transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+  position: relative;
+}
+
+.itemButton:hover,
+.itemButton:focus-visible {
+  border-color: rgba(118, 168, 255, 0.6);
+  box-shadow: 0 15px 30px rgba(4, 6, 15, 0.45);
+  outline: none;
+}
+
+.itemActive {
+  border-color: rgba(118, 168, 255, 0.9);
+  background: linear-gradient(135deg, rgba(32, 58, 124, 0.9), rgba(6, 12, 28, 0.95));
+  box-shadow: 0 20px 45px rgba(4, 6, 20, 0.65);
+}
+
+.metaRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.25em;
+  color: rgba(164, 186, 231, 0.85);
+}
+
+.countPill {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  font-weight: 600;
+}
+
+.sender {
+  margin: 0.65rem 0 0.25rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.snippet {
+  margin: 0;
+  color: rgba(168, 183, 221, 0.95);
+  font-size: 0.95rem;
+  line-height: 1.45;
+  max-height: 3.2rem;
+  overflow: hidden;
+}
+
+.footerRow {
+  margin-top: 0.9rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.85rem;
+  color: rgba(159, 178, 223, 0.9);
+}
+
+.typePill {
+  border-radius: 999px;
+  padding: 0.15rem 0.75rem;
+  border: 1px solid transparent;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+}
+
+.typeText {
+  background: rgba(90, 121, 255, 0.12);
+  border-color: rgba(90, 121, 255, 0.4);
+  color: #c6d1ff;
+}
+
+.typeImage {
+  background: rgba(79, 178, 134, 0.12);
+  border-color: rgba(88, 214, 160, 0.45);
+  color: #c7ffea;
+}
+
+.typeFile {
+  background: rgba(255, 186, 120, 0.15);
+  border-color: rgba(255, 186, 120, 0.4);
+  color: #ffe0c5;
+}
