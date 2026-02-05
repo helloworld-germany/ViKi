@@ -36,6 +36,10 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const isPendingStopRef = useRef<boolean>(false);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const serverReadyRef = useRef<boolean>(false);
+  
+  // Analyser Refs
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
 
   const stopPlayback = useCallback((ctx: AudioContext) => {
     console.log("[VoiceConsole] Interrupt! Stopping playback (Barge-in)");
@@ -50,7 +54,11 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const cleanup = useCallback(() => {
     isPendingStopRef.current = true;
     
-    // Stop all playing audio
+    if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+    }
+    
     if (audioContextRef.current) {
         // We can't use stopPlayback here directly if ctx is null/closed, 
         // but manually cleaning sources is good practice
@@ -139,7 +147,7 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
       }
       
       const rms = Math.sqrt(sumSq / int16.length);
-      setIncomingVolume(Math.min(100, rms * 500)); 
+      // setIncomingVolume(Math.min(100, rms * 500)); // REMOVED: Now handled by AnalyserNode
       
       // Update Debug Log with RMS to verify data silence vs playback silence
       setDebugLog(`RX: ${data.length}b, RMS=${rms.toFixed(4)}, CTX=${ctx.state}`);
@@ -155,13 +163,47 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
 
         const src = ctx.createBufferSource();
         src.buffer = buffer;
-        src.connect(ctx.destination);
+
+        // Connect to Analyser instead of Destination
+        if (analyserRef.current) {
+            src.connect(analyserRef.current);
+        } else {
+            src.connect(ctx.destination);
+        }
 
         const now = ctx.currentTime;
-        // Fix drift: If we are behind (underrun) or too far ahead (latency > 200ms)
-        if (nextStartTimeRef.current < now || (nextStartTimeRef.current - now) > 0.2) {
-             // console.log("Drift correction: Resetting playback time");
-             nextStartTimeRef.current = now;
+        // Fix drift: If we are behind (underrun) or too far ahead (latency > 2.0s)
+        const offset = nextStartTimeRef.current - now;
+        
+        // Logic:
+        // 1. If 'offset' < 0 => We are behind (Underrun).
+        // 2. If 'offset' > 2.0 => We are too far ahead (Latency).
+        
+        if (offset < 0 || offset > 2.0) {
+             console.log(`[VoiceConsole] Drift/Underrun. Offset: ${offset.toFixed(3)}s`);
+             
+             if (offset > 2.0) {
+                 // Too much latency? FLUSH.
+                 activeSourcesRef.current.forEach(node => {
+                    try { node.stop(); } catch(e) {}
+                 });
+                 activeSourcesRef.current = [];
+                 nextStartTimeRef.current = now + 0.3; // Reset with safe buffer
+             } 
+             else if (offset < 0) {
+                 // UNDERRUN (We ran dry)
+                 // "Speed to fast" or "Chunked" usually means we are playing faster than network delivery.
+                 // We MUST add a safety buffer (Jitter Buffer) to smooth this out.
+                 
+                 // If we were just slightly behind (<50ms), maybe it was just a frame drop.
+                 // But user report suggests frequent drops.
+                 // New strategy: ALWAYS add a hearty buffer when we run dry.
+                 
+                 const JITTER_BUFFER_MS = 0.5; // 500ms buffer! (Solves "beginning cut off" and "chunked")
+                 
+                 console.log(`[VoiceConsole] Underrun detected! Adding ${JITTER_BUFFER_MS}s safety buffer.`);
+                 nextStartTimeRef.current = now + JITTER_BUFFER_MS;
+             }
         }
         
         const startTime = nextStartTimeRef.current;
@@ -202,6 +244,36 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         const ctx = new AudioContextClass({ sampleRate: 24000 });
         audioContextRef.current = ctx;
         nextStartTimeRef.current = ctx.currentTime;
+        
+        // Setup Analyser
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyserRef.current = analyser;
+        analyser.connect(ctx.destination);
+        
+        // Start Analysis Loop
+        const updateVisuals = () => {
+             if (status === 'error' || isPendingStopRef.current || !analyserRef.current) return;
+             
+             const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+             analyserRef.current.getByteTimeDomainData(dataArray);
+             
+             // Calculate RMS
+             let sum = 0;
+             for(let i = 0; i < dataArray.length; i++) {
+                 // Convert 128-center byte to -1..1 float
+                 const float = (dataArray[i] - 128) / 128.0; 
+                 sum += float * float;
+             }
+             const rms = Math.sqrt(sum / dataArray.length);
+             
+             // Visualization Gain (Boost small signals)
+             setIncomingVolume(Math.min(100, rms * 400 * 100)); // *100 for percentage
+             
+             animationFrameRef.current = requestAnimationFrame(updateVisuals);
+        };
+        animationFrameRef.current = requestAnimationFrame(updateVisuals);
+
         console.log(`[VoiceConsole] AudioContext created. State: ${ctx.state}`);
 
         // Load AudioWorklet Module
@@ -248,9 +320,14 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
         processorRef.current = workletNode;
 
+        // Create a silent sink to keep the worklet running without loopback to speakers
+        const silentGain = ctx.createGain();
+        silentGain.gain.value = 0;
+
         source.connect(workletNode);
-        workletNode.connect(ctx.destination); // Keep alive
-        console.log("[VoiceConsole] Audio graph connected.");
+        workletNode.connect(silentGain);
+        silentGain.connect(ctx.destination); 
+        console.log("[VoiceConsole] Audio graph connected (Loopback muted).");
 
         // 3. Create Request Stream Processing Loop
         const CHUNK_SIZE_MS = 100; // Reduced from 250ms for lower latency
@@ -300,8 +377,10 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
 
             // Visual Mic Volume
             // Use the calculated RMS, but if gated, show 0 to match reality
-            const visualRms = isSilence ? 0 : (rms * DIGITAL_GAIN);
-            setMicVolume(v => Math.max(v * 0.9, visualRms * 100)); // Smooth decay
+            // We use a separate higher gain for visualization so the bar moves clearly even when speaking softly.
+            const VISUAL_GAIN = 50.0; 
+            const visualRms = isSilence ? 0 : (rms * VISUAL_GAIN);
+            setMicVolume(v => Math.max(v * 0.85, visualRms * 100)); // Smooth decay (0.85 per ~5ms frame)
 
             if (pcmBuffer.length >= BUFFER_SIZE) {
                 // FIX: Don't drop data while waiting for connection
@@ -444,6 +523,7 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
                             else if (msg.t === 'ping') {
                                 // Heartbeat - keep alive
                                 setDebugLog("RX: PING (Heartbeat)");
+                                // Do NOT allow heartbeat to reset silence/timeouts if we implement them later
                             } else {
                                 console.log("[VoiceConsole] Received unknown message:", msg);
                             }
@@ -454,7 +534,22 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
                     }
                 }
             }
-            cleanup();
+            // IF LOOP BREAKS -> RECONNECT?
+            // "Stream ended" usually means server closed connection.
+            // If session is still 'live', we should probably try to reconnect or show status.
+            console.log("[VoiceConsole] Stream Loop Exited");
+            
+            // cleanup(); // DON'T CLEANUP IMMEDIATELY causing "No more AI voice"
+            // If the stream ends naturally (e.g. cloud function timeout), we might need to re-establish
+            // BUT for now, let's just log it. The Function should keep stream open for 60s+
+            
+            if (!isPendingStopRef.current) {
+               console.warn("[VoiceConsole] Stream died unexpectedly. Attempting reconnect...");
+               // For now, just show error to user so they know to toggle
+               setError("Voice connection lost. Please toggle off/on.");
+               setStatus('error');
+            }
+            
         }).catch (err => {
              console.error("[VoiceConsole] Voice Downlink Error:", err);
              setError(err.message || 'Connection lost');

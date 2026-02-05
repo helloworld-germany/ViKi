@@ -4,27 +4,12 @@ import { VoiceLiveClient, VoiceLiveSession } from '@azure/ai-voicelive';
 import { DefaultAzureCredential } from "@azure/identity";
 import { getEnv } from './env';
 import type { StoredConsult } from './consultRepository';
+import { logToApp } from './logger';
 import * as fs from 'fs';
 import * as path from 'path';
 
 export function logToDebug(msg: string) {
-  try {
-    // Separate log file to avoid Azurite lock contention
-    const logPath = path.resolve(process.cwd(), '../../app.log');
-    
-    // Fallback if CWD is weird
-    const fallbackPath = 'C:\\Users\\yingdingwang\\Documents\\VCS\\pocs\\virtualclinic\\app.log';
-    
-    const entry = `${new Date().toISOString()} [VoiceLiveClient] ${msg}\n`;
-    
-    try {
-        fs.appendFileSync(logPath, entry);
-    } catch {
-        fs.appendFileSync(fallbackPath, entry);
-    }
-  } catch(e) {
-     // console.error(e);
-  }
+  logToApp('VoiceLiveClient', msg);
 }
 
 export async function createVoiceLiveSession(consult: StoredConsult, callbacks?: { 
@@ -34,10 +19,16 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
   vadThreshold?: number;
 }): Promise<VoiceLiveSession> {
   const env = getEnv();
+  const sessionId = Math.random().toString(36).substring(7);
+  const logPrefix = `[VoiceLive:${sessionId}]`;
+
+  function logWithId(msg: string) {
+    logToDebug(`${logPrefix} ${msg}`);
+  }
 
   // MOCK MODE: If endpoint contains "mock" or if forced
   if (env.FOUNDRY_RESOURCE_ENDPOINT.includes('mock') || process.env.USE_MOCK_VOICE === 'true') {
-      logToDebug('Using MOCK Session (forced or mock endpoint)');
+      logWithId('Using MOCK Session (forced or mock endpoint)');
       return createMockSession(callbacks);
   }
 
@@ -47,15 +38,15 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
   // Create the VoiceLive client
   let session;
   try {
-      logToDebug(`Connect: Initializing client for ${endpoint}`);
+      logWithId(`Connect: Initializing client for ${endpoint}`);
       const client = new VoiceLiveClient(endpoint, credential);
       
-      logToDebug(`Connect: Calling startSession('${env.VOICELIVE_REALTIME_DEPLOYMENT}')...`);
+      logWithId(`Connect: Calling startSession('${env.VOICELIVE_REALTIME_DEPLOYMENT}')...`);
       const startTime = Date.now();
       session = await client.startSession(env.VOICELIVE_REALTIME_DEPLOYMENT);
-      logToDebug(`Connect: Connected successfully in ${Date.now() - startTime}ms`);
+      logWithId(`Connect: Connected successfully in ${Date.now() - startTime}ms`);
   } catch (err: any) {
-      logToDebug(`Connection failed (${err.message}). Falling back to MOCK session.`);
+      logWithId(`Connection failed (${err.message}). Falling back to MOCK session.`);
       console.warn(`[VoiceLive] Connection failed (${err.message}). Falling back to MOCK session.`);
       return createMockSession(callbacks);
   }
@@ -149,6 +140,13 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
     },
     onResponseAudioDelta: async (event, context) => {
       // Handle incoming audio chunks
+      logWithId(`Received audio chunk: ${event.delta.byteLength} bytes`);
+       try {
+           const debugPcmPath = path.resolve(process.cwd(), '../../debugassets/debug_response.pcm');
+           fs.appendFileSync(debugPcmPath, new Uint8Array(event.delta));
+       } catch (e) {
+           // ignore file errors during high load
+       }
       if (callbacks?.onAudioData) {
         callbacks.onAudioData(event.delta);
       }
@@ -156,7 +154,7 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
 
     // Handle user speech start (barge-in)
     onInputAudioBufferSpeechStarted: async (event, context) => {
-       logToDebug(" [Speech Started Detected] ");
+       logWithId(" [Speech Started Detected] ");
        if (callbacks?.onInputStarted) {
          callbacks.onInputStarted();
        }
@@ -164,12 +162,12 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
 
     onResponseTextDelta: async (event, context) => {
       // Handle incoming text deltas
-      logToDebug("Assistant: " + event.delta);
+      logWithId("Assistant: " + event.delta);
     },
 
     onConversationItemInputAudioTranscriptionCompleted: async (event, context) => {
       // Handle user speech transcription
-      logToDebug("User said: " + event.transcript);
+      logWithId("User said: " + event.transcript);
     },
   });
 
@@ -206,7 +204,7 @@ export async function sendAudioInput(session: VoiceLiveSession, audioData: Array
   
   // Debug: Write audio to file to verify quality/rate
   try {
-      const debugPcmPath = path.resolve(process.cwd(), '../../debug_received.pcm');
+      const debugPcmPath = path.resolve(process.cwd(), '../../debugassets/debug_received.pcm');
       fs.appendFileSync(debugPcmPath, new Uint8Array(audioData));
   } catch(e) {}
 

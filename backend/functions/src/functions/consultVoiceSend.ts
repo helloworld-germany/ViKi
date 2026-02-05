@@ -1,21 +1,10 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { SessionManager } from '../lib/voiceSessionManager';
 import { sendAudioInput, logToDebug } from '../lib/voiceliveclient';
-import * as fs from 'fs';
-import * as path from 'path';
+import { logToApp } from '../lib/logger';
 
 function logVoiceSend(msg: string) {
-    try {
-        const logPath = path.resolve(process.cwd(), '../../app.log');
-        const fallbackPath = 'C:\\Users\\yingdingwang\\Documents\\VCS\\pocs\\virtualclinic\\app.log';
-        const entry = `${new Date().toISOString()} [VoiceSend] ${msg}\n`;
-        try {
-            fs.appendFileSync(logPath, entry);
-        } catch {
-             fs.appendFileSync(fallbackPath, entry);
-        }
-    } catch (e) {
-    }
+    logToApp('VoiceSend', msg);
 }
 
 export async function handler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
@@ -25,10 +14,11 @@ export async function handler(request: HttpRequest, context: InvocationContext):
     if (!id) return { status: 400, jsonBody: { error: 'Missing consult id' } };
 
     try {
-        const active = SessionManager.get(id);
+        // Wait for session to be active (handles pending state during connection)
+        const active = await SessionManager.waitForSession(id, 10000); // 10s timeout
         
         if (!active) {
-            logVoiceSend(`No active session found for ${id}. Available: ${SessionManager.listKeys().join(', ')}`);
+            logVoiceSend(`No active session found for ${id} after wait. Available: ${SessionManager.listKeys().join(', ')}`);
             return { status: 404, jsonBody: { error: 'No active session. Connect to voice-listen first.' } };
         }
 

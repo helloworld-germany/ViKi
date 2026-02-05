@@ -69,46 +69,74 @@ export async function handler(request: HttpRequest, context: InvocationContext):
 
         // Connect to VoiceSession
         let hbInterval: NodeJS.Timeout;
+        let flushInterval: NodeJS.Timeout;
 
         const stream = new ReadableStream({
             async start(controller) {
                 // 0. Initial Open
                 controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
 
-                // 1. Setup Heartbeat
+                // Buffering State
+                let audioBuffer: Buffer = Buffer.alloc(0);
+                const PREFERRED_CHUNK_SIZE = 4096; // ~85ms of audio (24kHz 16bit)
+
+                const flushAudio = () => {
+                     if (audioBuffer.length === 0) return;
+                     try {
+                        const b64 = audioBuffer.toString('base64');
+                        const msg = `data: ${JSON.stringify({ t: 'audio', d: b64 })}\n\n`;
+                        controller.enqueue(new TextEncoder().encode(msg));
+                        audioBuffer = Buffer.alloc(0);
+                     } catch (e) {
+                         // Stream likely closed
+                     }
+                };
+
+                // 1. Setup Heartbeat & Flush
                 hbInterval = setInterval(() => {
                     try {
                         controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
                     } catch (e) {
-                         // Stream closed
                          clearInterval(hbInterval);
+                         clearInterval(flushInterval);
                     }
                 }, 10000);
+
+                flushInterval = setInterval(() => {
+                    flushAudio();
+                }, 150); // Flush any pending audio every 150ms if not filled
 
                 try {
                      // 2. Setup Session
                      await SessionManager.remove(id); // Clean any stale session
                      
+                     const ticket = SessionManager.reserve(id);
+                     
                      const session = await createVoiceLiveSession(consult, {
                         onAudioData: (data) => {
                              try {
-                                const b64 = Buffer.from(data).toString('base64');
-                                const msg = `data: ${JSON.stringify({ t: 'audio', d: b64 })}\n\n`;
-                                controller.enqueue(new TextEncoder().encode(msg));
+                                const chunk = Buffer.from(data);
+                                audioBuffer = Buffer.concat([audioBuffer, chunk]);
+                                
+                                if (audioBuffer.length >= PREFERRED_CHUNK_SIZE) {
+                                    flushAudio();
+                                }
                              } catch (e) {
-                                 // Controller closed or error
-                                 context.warn(`[VoiceListen] Error enqueueing audio: ${e}`);
+                                 context.warn(`[VoiceListen] Error buffering audio: ${e}`);
                              }
                         },
                         onInputStarted: () => {
                              try {
+                                // Flush anything pending first? 
+                                // No, usually we want to clear.
+                                audioBuffer = Buffer.alloc(0); // CLEAR BUFFER
                                 const msg = `data: ${JSON.stringify({ t: 'clear' })}\n\n`;
                                 controller.enqueue(new TextEncoder().encode(msg));
                              } catch (e) { /* ignore */ }
                         }
                      });
 
-                     SessionManager.register(id, session);
+                     SessionManager.register(id, session, ticket); // Pass ticket to prevent race conditions
                      
                      // Attach controller to session manager to allow external closing
                      SessionManager.attachController(id, controller);
@@ -125,6 +153,7 @@ export async function handler(request: HttpRequest, context: InvocationContext):
             cancel() {
                 context.log(`[VoiceListen] Stream cancelled for ${id}`);
                 clearInterval(hbInterval);
+                clearInterval(flushInterval);
                 SessionManager.remove(id).catch(e => context.error(e));
             }
         });

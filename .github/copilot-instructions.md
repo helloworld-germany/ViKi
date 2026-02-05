@@ -79,6 +79,10 @@ FOLDER CREATION RULES:
 - If you are running any terminal commands, use the '.' argument to ensure that the current working directory is used ALWAYS.
 - Do not create a new folder unless the user explicitly requests it besides a .vscode folder for a tasks.json file.
 - If any of the scaffolding commands mention that the folder name is not correct, let the user know to create a new folder with the correct name and then reopen it again in vscode.
+- Specific Directory Usage:
+  - `debugassets/`: Use this folder to save and call temporary debug scripts, tools, or assets (e.g., test scripts, dump files).
+  - `docs/`: Place all documentation files here.
+  - `log/`: Store all application and debug logs here.
 
 EXTENSION INSTALLATION RULES:
 - Only install extension specified by the get_project_setup_info tool. DO NOT INSTALL any other extensions.

@@ -20,22 +20,15 @@ Minimal viable product for a virtual pediatric clinic that ingests secure NetSfe
    - Enable API + webhook for the bot identity (e.g., `botdo@sweethomeonline.de`).
    - Point the webhook to `https://<function-app>.azurewebsites.net/api/netsfere-webhook`.
 3. **Run Backend Locally**
-   <!-- used npm start to start azurite storage emulator and func start
-   Start `Azurite`
-   ```powershell
-   # $ProjPath is the subpath from USERPROFILE to the current virtual clinic repository
-   $ProjPath="Documents\VCS\pocs\virtualclinic";
-   azurite --silent --location $env:USERPROFILE\$ProjPath --debug $env:USERPROFILE\$ProjPath\debug.log;
-   ```
-   -->
    
    Create a `local.settings.json` in `backend/functions` folder to save the config for backend.
-   ```
+   ```bash
    cd backend/functions
    npm install
    npm run build
    npm start
    ```
+   *Note: `npm start` launches both Azurite (storage emulator) and the Azure Functions runtime concurrently. Logs are saved to `log/` folder in the project root.*
 4. **Run Specialist Portal**
    ```
    cd frontend/portal

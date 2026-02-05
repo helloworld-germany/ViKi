@@ -1,6 +1,7 @@
-Write-Host "Starting Virtual Clinic Services..."
+Write-Host "Starting Virtual Clinic Services... [$(Get-Date)]"
 
 # Check ports
+$backendEnv = @{ "USE_MOCK_VOICE" = "false" }
 $portsToCheck = @(7071, 10000, 3000)
 $portsBusy = $false
 foreach ($p in $portsToCheck) {
@@ -21,17 +22,16 @@ if ($portsBusy) {
 
 # Clear debug logs
 Write-Host "Clearing debug logs..."
-# Remove-Item debug.log -ErrorAction SilentlyContinue
-Clear-Content "debug.log" -ErrorAction SilentlyContinue
-Clear-Content "app.log" -ErrorAction SilentlyContinue
+if (-not (Test-Path "log")) { New-Item -ItemType Directory -Path "log" -Force }
+Clear-Content "log/debug.log" -ErrorAction SilentlyContinue
+Clear-Content "log/app.log" -ErrorAction SilentlyContinue
 
 # Start Backend (Azure Functions + Azurite)
 Write-Host "Launching Backend (backend/functions)..."
-$backendEnv = @{ "USE_MOCK_VOICE" = "true" }
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$env:USE_MOCK_VOICE='true'; `$Host.UI.RawUI.WindowTitle = 'ViKi Backend'; cd backend/functions; npm start"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Backend'; cd backend/functions; npm start"
 
 # Start Frontend (Next.js Portal)
 Write-Host "Launching Frontend (frontend/portal)..."
 Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Frontend'; cd frontend/portal; npm run dev"
 
-Write-Host "Services launched in separate windows."
+Write-Host "Services launched in separate windows. [$(Get-Date)]"
