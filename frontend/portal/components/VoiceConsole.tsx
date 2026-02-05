@@ -1,5 +1,6 @@
 "use client";
 
+import clsx from 'clsx';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { API_BASE_URL } from '../lib/config';
 
@@ -133,34 +134,36 @@ export function VoiceConsole({ consultId }: Props) {
     }
   }, [status, teardown]);
 
+  const isActive = status === 'live';
+  const statusCopy = consultId ? `Status: ${status}` : 'Select a consult to enable voice review';
+  const statusColor =
+    status === 'live' ? 'bg-[#4ade80]' : status === 'connecting' ? 'bg-[#facc15]' : status === 'error' ? 'bg-[#f87171]' : 'bg-[#64748b]';
+
   return (
-    <section className="rounded-3xl border border-[#1c3b6b] bg-[rgba(7,12,24,0.85)] p-5 shadow-xl">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm uppercase tracking-wider text-[var(--muted)]">Realtime Voice</h3>
-        {status !== 'live' ? (
-          <button
-            type="button"
-            disabled={!consultId || status === 'connecting'}
-            className="rounded-full border border-[#00f3ff] px-4 py-2 text-xs font-semibold text-[#00f3ff] disabled:opacity-40"
-            onClick={startSession}
-          >
-            {status === 'connecting' ? 'Connecting…' : 'Start session'}
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="rounded-full border border-[#f87171] px-4 py-2 text-xs font-semibold text-[#f87171]"
-            onClick={stopSession}
-          >
-            Stop session
-          </button>
-        )}
+    <section className="rounded-2xl border border-[#20345f] bg-[rgba(10,18,34,0.85)] px-5 py-4 shadow-[0_10px_25px_rgba(5,11,26,0.6)]">
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="flex-1 min-w-[240px]">
+          <p className="text-xs uppercase tracking-[0.4em] text-[var(--muted)]">Realtime voice</p>
+          <div className="mt-2 flex items-center gap-2 text-sm text-white" aria-live="polite">
+            <span className={clsx('inline-flex h-2.5 w-2.5 rounded-full', statusColor)} aria-hidden="true" />
+            <span>{statusCopy}</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={!consultId || status === 'connecting'}
+          onClick={isActive ? stopSession : startSession}
+          aria-pressed={isActive}
+          className={clsx(
+            'relative inline-flex items-center rounded-full px-6 py-2 text-sm font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#5b8efc]',
+            isActive ? 'bg-[#5b8efc] text-white shadow-[0_10px_20px_rgba(39,97,255,0.35)]' : 'bg-[#101b34] text-[#9ab5ff] border border-[#324a82] disabled:opacity-40'
+          )}
+        >
+          {status === 'connecting' ? 'Connecting…' : isActive ? 'Stop session' : 'Start realtime voice'}
+        </button>
       </div>
-      <p className="mt-3 text-sm text-[var(--muted)]">
-        {consultId ? `Status: ${status}` : 'Select a consult to enable voice review.'}
-      </p>
       {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-      <audio ref={audioRef} autoPlay playsInline className="mt-4 w-full rounded-2xl bg-[#0c1527]" />
+      <audio ref={audioRef} autoPlay playsInline className="sr-only" />
     </section>
   );
 }

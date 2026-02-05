@@ -1,23 +1,23 @@
 import useSWR from 'swr';
 import { API_BASE_URL } from './config';
+import { apiFetch } from './api';
 import type { ConsultSummary, ConsultDetail } from './types';
 
-const fetcher = async <T>(input: string): Promise<T> => {
-  const res = await fetch(input);
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-  return res.json() as Promise<T>;
-};
-
 export function useConsults() {
-  const { data, error, isLoading, mutate } = useSWR<ConsultSummary[]>(`${API_BASE_URL}/consults`, fetcher, {
-    refreshInterval: 15_000
-  });
+  const { data, error, isLoading, isValidating, mutate } = useSWR<ConsultSummary[]>(
+    `${API_BASE_URL}/consults`,
+    (url) => apiFetch<ConsultSummary[]>(url),
+    {
+      refreshInterval: 15_000,
+      revalidateOnFocus: false
+    }
+  );
   return {
     consults: data ?? [],
     isLoading,
+    isRefreshing: isValidating,
     isError: Boolean(error),
+    errorMessage: error?.message ?? '',
     refresh: mutate
   };
 }
@@ -26,12 +26,16 @@ export function useConsultDetail(id?: string) {
   const shouldFetch = Boolean(id);
   const { data, error, isLoading, mutate } = useSWR<ConsultDetail>(
     shouldFetch ? `${API_BASE_URL}/consults/${id}` : null,
-    fetcher
+    (url) => apiFetch<ConsultDetail>(url),
+    {
+      revalidateOnFocus: false
+    }
   );
   return {
     consult: data,
     isLoading,
     isError: Boolean(error),
+    errorMessage: error?.message ?? '',
     refresh: mutate
   };
 }

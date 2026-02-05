@@ -39,7 +39,22 @@ Azure Functions codebase that ingests NetSfere consults and forwards them to dow
    ```
    The "senderEmail" must be the user email you want to fetch msg or ignore it.
 
-> Ensure `local.settings.json` contains temporary NetSfere credentials and a Service Bus connection string for local testing only.
+> Ensure `local.settings.json` contains temporary NetSfere credentials, Azure Storage, and the Azure Voice Live keys described below for local testing only.
+
+### Voice Live configuration
+
+Create an Azure Voice Live project/agent in the Microsoft Foundry portal, then set these values in `backend/functions/local.settings.json` (or in your Function App settings):
+
+| Setting | Description |
+| --- | --- |
+| `AZURE_VOICELIVE_ENDPOINT` | Voice Live endpoint URI from the Foundry project (for example `https://<project>.services.ai.azure.com`). |
+| `AZURE_VOICELIVE_API_VERSION` | API version to call, e.g. `2025-10-01`. |
+| `AZURE_VOICELIVE_MODEL` | Voice Live model such as `gpt-realtime` or `gpt-realtime-mini`. |
+| `AZURE_VOICELIVE_VOICE` | Azure Speech voice to render responses (for example `en-US-Ava:DragonHDLatestNeural`). |
+| `AZURE_VOICELIVE_PROJECT_NAME` | Foundry project name tied to the Voice Live resource. |
+| `AZURE_VOICELIVE_API_KEY` | API key (or use a managed identity and omit this field in production). |
+
+These values allow the `/api/consults/{id}/voice-token` endpoint to mint short-lived Voice Live sessions that include the originating NetSfere consult context.
 
 ## netsfere client sample
 ```powershell
@@ -56,4 +71,16 @@ Invoke-RestMethod -Uri "https://api.netsfere.com/get" `
 ```
 Note:`
 * use `web.netsfere.com` to see the convID from the webbrowser, or use `convId="0"` and `msgId="0"` to get all the messages for the user with given email.  
+
+## Verifying the NetSfere ingest path
+
+1. **Probe the API** — Post the identifiers you want to test to `http://localhost:7071/api/netsfere/pull`:
+   ```powershell
+   Invoke-RestMethod -Uri "http://localhost:7071/api/netsfere/pull" -Method Post -Body '{"convId":27848,"msgId":212619}' -ContentType 'application/json'
+   ```
+   A `200` response confirms the configured credentials can read from NetSfere.
+2. **Store the consult** — Send the same payload to `/api/netsfere/webhook` to trigger persistence in Blob Storage.
+3. **List results** — Call `/api/consults` (or `/api/consults/{id}`) to confirm the consult appears in the portal feed.
+
+Repeat as needed while Azurite + the Functions host are running locally (`npm start`).
 

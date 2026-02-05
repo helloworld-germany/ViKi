@@ -1,6 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { getConsult } from '../lib/consultRepository';
-import { createRealtimeSession } from '../lib/openAiRealtime';
+import { createVoiceLiveSession } from '../lib/voiceLiveClient';
 
 async function handler(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   const id = request.params?.id;
@@ -21,7 +21,7 @@ async function handler(request: HttpRequest, context: InvocationContext): Promis
       };
     }
 
-    const session = await createRealtimeSession(consult);
+    const session = await createVoiceLiveSession(consult);
 
     return {
       status: 200,
