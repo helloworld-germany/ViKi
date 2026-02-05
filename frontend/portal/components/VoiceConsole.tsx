@@ -26,19 +26,51 @@ class ReorderBuffer {
     
     push(seq: number, data: Float32Array) {
         this.pending.set(seq, data);
+        console.log(`[ReorderBuffer] Push S=${seq}. Expected=${this.expected}. Pending=${this.pending.size}`);
     }
     
     popReady(): Float32Array[] {
-        const out: Float32Array[] = [];
+        const out: Float32Array[] = []; 
         while (this.pending.has(this.expected)) {
             out.push(this.pending.get(this.expected)!);
             this.pending.delete(this.expected);
             this.expected += 1;
         }
+        if (out.length > 0) {
+            console.log(`[ReorderBuffer] Popped ${out.length} chunks. NewExpected=${this.expected}`);
+        }
         return out;
     }
     
+    // Resync: Jump to a new sequence if we're too far behind
+    resync(newSeq: number) {
+        console.log(`[ReorderBuffer] RESYNC: Jumping from expected=${this.expected} to ${newSeq}`);
+        this.expected = newSeq;
+    }
+    
+    // Flush: Return all pending chunks regardless of order (for emergency playback)
+    flush(): Float32Array[] {
+        const out: Float32Array[] = [];
+        // Sort by sequence and return all
+        const sorted = Array.from(this.pending.entries()).sort((a, b) => a[0] - b[0]);
+        for (const [seq, data] of sorted) {
+            out.push(data);
+        }
+        if (out.length > 0) {
+            console.log(`[ReorderBuffer] FLUSH: Returning ${out.length} chunks out-of-order`);
+            // Update expected to highest + 1
+            const maxSeq = sorted[sorted.length - 1]?.[0] ?? this.expected;
+            this.expected = maxSeq + 1;
+        }
+        this.pending.clear();
+        return out;
+    }
+    
+    getExpected() { return this.expected; }
+    getPendingSize() { return this.pending.size; }
+    
     reset() {
+        console.log(`[ReorderBuffer] RESET`);
         this.expected = 1;
         this.pending.clear();
     }
@@ -65,6 +97,7 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const playerNodeRef = useRef<AudioWorkletNode | null>(null);
   const bufferedSamplesRef = useRef<number>(0);
   const isPlayingRef = useRef<boolean>(false);
+  const earlyChunkQueueRef = useRef<{seq: number, data: Float32Array}[]>([]); // Queue for chunks arriving before worklet ready
   
   // Analyser Refs
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -170,8 +203,15 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   };
 
   const playAudioChunk = (data: Uint8Array, ctx: AudioContext, seq: number) => {
-      if (ctx.state === 'closed') return;
-      if (ctx.state === 'suspended') ctx.resume().catch(e => console.warn("Resume failed", e));
+      // Safety: Resume AudioContext if suspended (browser autoplay policy)
+      if (ctx.state === 'closed') {
+          console.warn(`[VoiceConsole] AudioContext is CLOSED. Cannot play S=${seq}.`);
+          return;
+      }
+      if (ctx.state === 'suspended') {
+          console.log(`[VoiceConsole] AudioContext SUSPENDED. Resuming...`);
+          ctx.resume().catch(e => console.warn("Resume failed", e));
+      }
 
       // Decode Int16 -> Float32
       const bufferCopy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
@@ -187,25 +227,59 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
       }
       
       const rms = Math.sqrt(sumSq / int16.length);
-      setDebugLog(`RX: ${data.length}b, RMS=${rms.toFixed(4)}, S=${seq}`); // Re-enabled
+      const rb = reorderBufferRef.current;
+      
+      console.log(`[VoiceConsole] RX Chunk: S=${seq}, Bytes=${data.length}, RMS=${rms.toFixed(4)}, Expected=${rb.getExpected()}, Buffered=${bufferedSamplesRef.current}, Playing=${isPlayingRef.current}`);
+      setDebugLog(`S=${seq} | Exp=${rb.getExpected()} | Buf=${bufferedSamplesRef.current} | Play=${isPlayingRef.current}`);
 
       try {
         const node = playerNodeRef.current;
         
-        // IMMEDIATE PLAYBACK MODE (Bypass ReorderBuffer)
-        if (node) {
-            node.port.postMessage(float32, [float32.buffer]);
-            bufferedSamplesRef.current += float32.length;
-            
-            // Minimal gating (50ms)
-            const TARGET_LATENCY_SAMPLES = 24000 * 0.05; 
-            
-            if (!isPlayingRef.current && bufferedSamplesRef.current >= TARGET_LATENCY_SAMPLES) {
-                console.log("[VoiceConsole] Start threshold reached. Playing.");
-                node.port.postMessage({ cmd: 'start' });
-                isPlayingRef.current = true;
-            }
+        // If Worklet not ready yet, queue for later
+        if (!node) {
+            console.log(`[VoiceConsole] Worklet NOT READY. Queuing S=${seq} for later.`);
+            earlyChunkQueueRef.current.push({ seq, data: float32 });
             return;
+        }
+        
+        // RESYNC CHECK: If incoming seq is way ahead of expected, resync
+        const GAP_THRESHOLD = 10;
+        if (seq > rb.getExpected() + GAP_THRESHOLD) {
+            console.warn(`[VoiceConsole] Large gap detected! S=${seq} vs Expected=${rb.getExpected()}. Resyncing.`);
+            rb.resync(seq);
+        }
+        
+        // Push to ReorderBuffer
+        rb.push(seq, float32);
+        
+        // FLUSH CHECK: If too many pending, flush to avoid stall
+        const MAX_PENDING = 20;
+        let readyChunks: Float32Array[];
+        if (rb.getPendingSize() > MAX_PENDING) {
+            console.warn(`[VoiceConsole] Pending buffer overflow (${rb.getPendingSize()}). Flushing.`);
+            readyChunks = rb.flush();
+        } else {
+            readyChunks = rb.popReady();
+        }
+        
+        // Send ready chunks to Worklet
+        if (readyChunks.length > 0) {
+            readyChunks.forEach(chunk => {
+                // Clone buffer before transfer (transfer detaches the original)
+                const clone = new Float32Array(chunk);
+                node.port.postMessage(clone, [clone.buffer]);
+                bufferedSamplesRef.current += chunk.length;
+            });
+            console.log(`[VoiceConsole] Sent ${readyChunks.length} chunks to Worklet. TotalBuffered=${bufferedSamplesRef.current}`);
+        }
+        
+        // Start Gating: Wait for ~100ms (2400 samples) before starting playback
+        const TARGET_LATENCY_SAMPLES = 24000 * 0.1; // 100ms
+        
+        if (!isPlayingRef.current && bufferedSamplesRef.current >= TARGET_LATENCY_SAMPLES) {
+            console.log(`[VoiceConsole] Buffer threshold reached (${bufferedSamplesRef.current}/${TARGET_LATENCY_SAMPLES}). Sending START command.`);
+            node.port.postMessage({ cmd: 'start' });
+            isPlayingRef.current = true;
         }
       } catch (e) {
           console.warn("[VoiceConsole] Playback error:", e);
@@ -243,12 +317,29 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
             const playerNode = new AudioWorkletNode(ctx, 'pcm-player');
             playerNode.port.onmessage = (e) => {
                  if (e.data.type === 'debug') console.log("[Worklet]", e.data.msg);
+                 if (e.data.type === 'heartbeat') console.log(`[Worklet Heartbeat] Frame=${e.data.frame}, QueueSize=${e.data.queueSize}, Started=${e.data.started}, Played=${e.data.played}`);
             };
             playerNode.connect(analyser);
             playerNodeRef.current = playerNode;
             reorderBufferRef.current.reset();
             bufferedSamplesRef.current = 0;
             isPlayingRef.current = false;
+            
+            // Flush any early chunks that arrived before worklet was ready
+            if (earlyChunkQueueRef.current.length > 0) {
+                console.log(`[VoiceConsole] Flushing ${earlyChunkQueueRef.current.length} early chunks to worklet...`);
+                earlyChunkQueueRef.current.forEach(({ seq, data }) => {
+                    reorderBufferRef.current.push(seq, data);
+                });
+                const readyChunks = reorderBufferRef.current.popReady();
+                readyChunks.forEach(chunk => {
+                    const clone = new Float32Array(chunk);
+                    playerNode.port.postMessage(clone, [clone.buffer]);
+                    bufferedSamplesRef.current += chunk.length;
+                });
+                earlyChunkQueueRef.current = [];
+                console.log(`[VoiceConsole] Early chunk flush complete. Buffered=${bufferedSamplesRef.current}`);
+            }
         } catch (e) {
             console.error("[VoiceConsole] Worklet load failed:", e);
         }

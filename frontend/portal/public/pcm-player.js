@@ -6,17 +6,24 @@ class PcmPlayer extends AudioWorkletProcessor {
       super();
       this.queue = [];
       this.started = false;
+      this.frameCount = 0;
+      this.totalSamplesPlayed = 0;
 
       this.port.onmessage = (e) => {
         if (e.data.cmd === 'start') {
             this.started = true;
-            this.port.postMessage({ type: 'debug', msg: 'Started' });
+            this.port.postMessage({ type: 'debug', msg: 'CMD:Start received. Playing.' });
         } else if (e.data.cmd === 'stop') {
             this.started = false;
             this.queue = [];
-            this.port.postMessage({ type: 'debug', msg: 'Stopped' });
+            this.totalSamplesPlayed = 0;
+            this.port.postMessage({ type: 'debug', msg: 'CMD:Stop received. Queue cleared.' });
         } else if (e.data instanceof Float32Array) {
             this.queue.push(e.data);
+            // Log every 10th chunk received
+            if (this.queue.length % 10 === 1) {
+                this.port.postMessage({ type: 'debug', msg: `Chunk received. QueueSize=${this.queue.length}` });
+            }
         }
       };
     }
@@ -26,6 +33,12 @@ class PcmPlayer extends AudioWorkletProcessor {
       if (!output || !output[0]) return true;
       
       const channel = output[0];
+      this.frameCount++;
+      
+      // Heartbeat: Log every 500 frames (~10 seconds at 128 samples/frame @ 24kHz)
+      if (this.frameCount % 500 === 0) {
+          this.port.postMessage({ type: 'heartbeat', frame: this.frameCount, queueSize: this.queue.length, started: this.started, played: this.totalSamplesPlayed });
+      }
       
       // If not started or empty, output silence
       if (!this.started || this.queue.length === 0) {
@@ -52,6 +65,9 @@ class PcmPlayer extends AudioWorkletProcessor {
               this.queue.shift();
           }
       }
+      
+      // Track samples played
+      this.totalSamplesPlayed += offset;
       
       // If we ran out of data mid-frame, fill rest with silence
       if (offset < channel.length) {
