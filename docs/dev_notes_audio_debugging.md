@@ -39,6 +39,7 @@ Audio playback felt "choppy", the beginning of sentences was cut off, and speech
 **Fix:**
 -   Implemented a **Jitter Buffer** of **0.5 seconds**.
 -   When an underrun is detected (player runs dry), the next chunk is scheduled for `now + 0.5s`. This ensures smooth playback even with network variance.
+-   **Validation (Feb 05 2026):** Verified via "Echo Mode" test. User confirmed crystal clear audio loopback, proving the 0.5s Jitter Buffer and Frontend pipeline are working correctly.
 
 ## 4. Visualization (Green Bar) Unresponsive
 **Symptoms:**

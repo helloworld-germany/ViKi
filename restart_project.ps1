@@ -28,10 +28,10 @@ Clear-Content "log/app.log" -ErrorAction SilentlyContinue
 
 # Start Backend (Azure Functions + Azurite)
 Write-Host "Launching Backend (backend/functions)..."
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Backend'; cd backend/functions; npm start"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Backend'; cd backend/functions; npm start | Tee-Object -FilePath ../../log/backend.log"
 
 # Start Frontend (Next.js Portal)
 Write-Host "Launching Frontend (frontend/portal)..."
-Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Frontend'; cd frontend/portal; npm run dev"
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$Host.UI.RawUI.WindowTitle = 'ViKi Frontend'; cd frontend/portal; npm run dev | Tee-Object -FilePath ../../log/frontend.log"
 
 Write-Host "Services launched in separate windows. [$(Get-Date)]"

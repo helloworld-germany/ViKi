@@ -19,6 +19,31 @@ function base64ToUint8Array(base64: string) {
     return bytes;
 }
 
+
+class ReorderBuffer {
+    private expected = 1; // Backend starts at 1
+    private pending = new Map<number, Float32Array>();
+    
+    push(seq: number, data: Float32Array) {
+        this.pending.set(seq, data);
+    }
+    
+    popReady(): Float32Array[] {
+        const out: Float32Array[] = [];
+        while (this.pending.has(this.expected)) {
+            out.push(this.pending.get(this.expected)!);
+            this.pending.delete(this.expected);
+            this.expected += 1;
+        }
+        return out;
+    }
+    
+    reset() {
+        this.expected = 1;
+        this.pending.clear();
+    }
+}
+
 export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const [status, setStatus] = useState<VoiceStatus>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -36,6 +61,10 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
   const isPendingStopRef = useRef<boolean>(false);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const serverReadyRef = useRef<boolean>(false);
+  const reorderBufferRef = useRef<ReorderBuffer>(new ReorderBuffer());
+  const playerNodeRef = useRef<AudioWorkletNode | null>(null);
+  const bufferedSamplesRef = useRef<number>(0);
+  const isPlayingRef = useRef<boolean>(false);
   
   // Analyser Refs
   const analyserRef = useRef<AnalyserNode | null>(null);
@@ -43,10 +72,21 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
 
   const stopPlayback = useCallback((ctx: AudioContext) => {
     console.log("[VoiceConsole] Interrupt! Stopping playback (Barge-in)");
+    
+    // Clear legacy nodes
     activeSourcesRef.current.forEach(node => {
         try { node.stop(); } catch(e) {}
     });
     activeSourcesRef.current = [];
+
+    // Clear Worklet
+    if (playerNodeRef.current) {
+        playerNodeRef.current.port.postMessage({ cmd: 'stop' });
+    }
+    bufferedSamplesRef.current = 0;
+    isPlayingRef.current = false;
+    reorderBufferRef.current.reset();
+
     // Reset Start Time to now so new audio plays immediately
     nextStartTimeRef.current = ctx.currentTime;
   }, []);
@@ -57,6 +97,11 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
     if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
         animationFrameRef.current = null;
+    }
+
+    if (playerNodeRef.current) {
+        playerNodeRef.current.disconnect();
+        playerNodeRef.current = null;
     }
     
     if (audioContextRef.current) {
@@ -124,21 +169,16 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
     }
   };
 
-  const playAudioChunk = (data: Uint8Array, ctx: AudioContext) => {
-      if (ctx.state === 'closed') {
-          console.warn("[VoiceConsole] Context is closed, skipping chunk play");
-          return;
-      }
-      if (ctx.state === 'suspended') {
-          ctx.resume().catch(e => console.warn("Resume failed", e));
-      }
+  const playAudioChunk = (data: Uint8Array, ctx: AudioContext, seq: number) => {
+      if (ctx.state === 'closed') return;
+      if (ctx.state === 'suspended') ctx.resume().catch(e => console.warn("Resume failed", e));
 
       // Decode Int16 -> Float32
       const bufferCopy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
       const int16 = new Int16Array(bufferCopy);
       
       const float32 = new Float32Array(int16.length);
-      const PLAYBACK_GAIN = 1.2; // Mild boost for reception
+      const PLAYBACK_GAIN = 1.2; 
       
       let sumSq = 0;
       for (let i = 0; i < int16.length; i++) {
@@ -147,81 +187,26 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
       }
       
       const rms = Math.sqrt(sumSq / int16.length);
-      // setIncomingVolume(Math.min(100, rms * 500)); // REMOVED: Now handled by AnalyserNode
-      
-      // Update Debug Log with RMS to verify data silence vs playback silence
-      setDebugLog(`RX: ${data.length}b, RMS=${rms.toFixed(4)}, CTX=${ctx.state}`);
+      setDebugLog(`RX: ${data.length}b, RMS=${rms.toFixed(4)}, S=${seq}`); // Re-enabled
 
       try {
-        if (ctx.state === 'suspended') {
-             setDebugLog(`RESUMING CTX...`);
-             ctx.resume();
-        }
-
-        const buffer = ctx.createBuffer(1, float32.length, 24000);
-        buffer.getChannelData(0).set(float32);
-
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-
-        // Connect to Analyser instead of Destination
-        if (analyserRef.current) {
-            src.connect(analyserRef.current);
-        } else {
-            src.connect(ctx.destination);
-        }
-
-        const now = ctx.currentTime;
-        // Fix drift: If we are behind (underrun) or too far ahead (latency > 2.0s)
-        const offset = nextStartTimeRef.current - now;
+        const node = playerNodeRef.current;
         
-        // Logic:
-        // 1. If 'offset' < 0 => We are behind (Underrun).
-        // 2. If 'offset' > 2.0 => We are too far ahead (Latency).
-        
-        if (offset < 0 || offset > 2.0) {
-             console.log(`[VoiceConsole] Drift/Underrun. Offset: ${offset.toFixed(3)}s`);
-             
-             if (offset > 2.0) {
-                 // Too much latency? FLUSH.
-                 activeSourcesRef.current.forEach(node => {
-                    try { node.stop(); } catch(e) {}
-                 });
-                 activeSourcesRef.current = [];
-                 nextStartTimeRef.current = now + 0.3; // Reset with safe buffer
-             } 
-             else if (offset < 0) {
-                 // UNDERRUN (We ran dry)
-                 // "Speed to fast" or "Chunked" usually means we are playing faster than network delivery.
-                 // We MUST add a safety buffer (Jitter Buffer) to smooth this out.
-                 
-                 // If we were just slightly behind (<50ms), maybe it was just a frame drop.
-                 // But user report suggests frequent drops.
-                 // New strategy: ALWAYS add a hearty buffer when we run dry.
-                 
-                 const JITTER_BUFFER_MS = 0.5; // 500ms buffer! (Solves "beginning cut off" and "chunked")
-                 
-                 console.log(`[VoiceConsole] Underrun detected! Adding ${JITTER_BUFFER_MS}s safety buffer.`);
-                 nextStartTimeRef.current = now + JITTER_BUFFER_MS;
-             }
-        }
-        
-        const startTime = nextStartTimeRef.current;
-        src.start(startTime);
-        nextStartTimeRef.current = startTime + buffer.duration;
-        
-        // Debug
-        // setDebugLog(`Play: ${rms.toFixed(3)} @ ${startTime.toFixed(1)}`);
-
-        // Track active source for cancellation
-        activeSourcesRef.current.push(src);
-        src.onended = () => {
-            const index = activeSourcesRef.current.indexOf(src);
-            if (index > -1) {
-                activeSourcesRef.current.splice(index, 1);
+        // IMMEDIATE PLAYBACK MODE (Bypass ReorderBuffer)
+        if (node) {
+            node.port.postMessage(float32, [float32.buffer]);
+            bufferedSamplesRef.current += float32.length;
+            
+            // Minimal gating (50ms)
+            const TARGET_LATENCY_SAMPLES = 24000 * 0.05; 
+            
+            if (!isPlayingRef.current && bufferedSamplesRef.current >= TARGET_LATENCY_SAMPLES) {
+                console.log("[VoiceConsole] Start threshold reached. Playing.");
+                node.port.postMessage({ cmd: 'start' });
+                isPlayingRef.current = true;
             }
-        };
-
+            return;
+        }
       } catch (e) {
           console.warn("[VoiceConsole] Playback error:", e);
       }
@@ -250,6 +235,23 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
         analyser.fftSize = 256;
         analyserRef.current = analyser;
         analyser.connect(ctx.destination);
+
+        // Setup AudioWorklet Node (Jitter Buffer)
+        try {
+            console.log("[VoiceConsole] Loading PCM Player Worklet...");
+            await ctx.audioWorklet.addModule('/pcm-player.js');
+            const playerNode = new AudioWorkletNode(ctx, 'pcm-player');
+            playerNode.port.onmessage = (e) => {
+                 if (e.data.type === 'debug') console.log("[Worklet]", e.data.msg);
+            };
+            playerNode.connect(analyser);
+            playerNodeRef.current = playerNode;
+            reorderBufferRef.current.reset();
+            bufferedSamplesRef.current = 0;
+            isPlayingRef.current = false;
+        } catch (e) {
+            console.error("[VoiceConsole] Worklet load failed:", e);
+        }
         
         // Start Analysis Loop
         const updateVisuals = () => {
@@ -509,7 +511,7 @@ export function VoiceConsole({ consultId, isOffline = false }: Props) {
                             
                             if (msg.t === 'audio' && msg.d) {
                                 // Audio Packet
-                                playAudioChunk(base64ToUint8Array(msg.d), ctx);
+                                playAudioChunk(base64ToUint8Array(msg.d), ctx, msg.s || 0);
                             } 
                             else if (msg.t === 'clear') {
                                 // Barge-in Stop Signal

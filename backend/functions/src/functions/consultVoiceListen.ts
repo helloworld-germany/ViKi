@@ -1,5 +1,6 @@
 import { app, HttpRequest, HttpResponseInit, InvocationContext } from '@azure/functions';
 import { Readable, PassThrough } from 'stream';
+import { Buffer } from 'buffer';
 import { getConsult } from '../lib/consultRepository';
 import { createVoiceLiveSession, logToDebug } from '../lib/voiceliveclient';
 import { SessionManager } from '../lib/voiceSessionManager';
@@ -69,42 +70,20 @@ export async function handler(request: HttpRequest, context: InvocationContext):
 
         // Connect to VoiceSession
         let hbInterval: NodeJS.Timeout;
-        let flushInterval: NodeJS.Timeout;
 
         const stream = new ReadableStream({
-            async start(controller) {
+            async start(controller: ReadableStreamDefaultController) {
                 // 0. Initial Open
                 controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
 
-                // Buffering State
-                let audioBuffer: Buffer = Buffer.alloc(0);
-                const PREFERRED_CHUNK_SIZE = 4096; // ~85ms of audio (24kHz 16bit)
-
-                const flushAudio = () => {
-                     if (audioBuffer.length === 0) return;
-                     try {
-                        const b64 = audioBuffer.toString('base64');
-                        const msg = `data: ${JSON.stringify({ t: 'audio', d: b64 })}\n\n`;
-                        controller.enqueue(new TextEncoder().encode(msg));
-                        audioBuffer = Buffer.alloc(0);
-                     } catch (e) {
-                         // Stream likely closed
-                     }
-                };
-
-                // 1. Setup Heartbeat & Flush
+                // 1. Setup Heartbeat
                 hbInterval = setInterval(() => {
                     try {
                         controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
                     } catch (e) {
                          clearInterval(hbInterval);
-                         clearInterval(flushInterval);
                     }
                 }, 10000);
-
-                flushInterval = setInterval(() => {
-                    flushAudio();
-                }, 150); // Flush any pending audio every 150ms if not filled
 
                 try {
                      // 2. Setup Session
@@ -112,26 +91,29 @@ export async function handler(request: HttpRequest, context: InvocationContext):
                      
                      const ticket = SessionManager.reserve(id);
                      
+                     let chunkCount = 0;
                      const session = await createVoiceLiveSession(consult, {
-                        onAudioData: (data) => {
+                        onAudioData: (data: Uint8Array) => {
                              try {
-                                const chunk = Buffer.from(data);
-                                audioBuffer = Buffer.concat([audioBuffer, chunk]);
-                                
-                                if (audioBuffer.length >= PREFERRED_CHUNK_SIZE) {
-                                    flushAudio();
+                                // Direct Passthrough - No Buffering
+                                if (!data || data.byteLength === 0) return;
+                                chunkCount++;
+                                if (chunkCount <= 5 || chunkCount % 10 === 0) {
+                                    context.log(`[VoiceListen] Sending chunk #${chunkCount} (${data.byteLength} bytes)`);
                                 }
+                                const b64 = Buffer.from(data).toString('base64');
+                                // Add 's' (sequence) to the payload
+                                const msg = `data: ${JSON.stringify({ t: 'audio', d: b64, s: chunkCount })}\n\n`;
+                                controller.enqueue(new TextEncoder().encode(msg));
                              } catch (e) {
-                                 context.warn(`[VoiceListen] Error buffering audio: ${e}`);
+                                 context.warn(`[VoiceListen] Error enqueueing audio: ${e}`);
                              }
                         },
                         onInputStarted: () => {
                              try {
-                                // Flush anything pending first? 
-                                // No, usually we want to clear.
-                                audioBuffer = Buffer.alloc(0); // CLEAR BUFFER
-                                const msg = `data: ${JSON.stringify({ t: 'clear' })}\n\n`;
-                                controller.enqueue(new TextEncoder().encode(msg));
+                                context.log(`[VoiceListen] InputStarted detected. Sending clear...`);
+                                // const msg = `data: ${JSON.stringify({ t: 'clear' })}\n\n`;
+                                // controller.enqueue(new TextEncoder().encode(msg));
                              } catch (e) { /* ignore */ }
                         }
                      });
@@ -153,7 +135,7 @@ export async function handler(request: HttpRequest, context: InvocationContext):
             cancel() {
                 context.log(`[VoiceListen] Stream cancelled for ${id}`);
                 clearInterval(hbInterval);
-                clearInterval(flushInterval);
+
                 SessionManager.remove(id).catch(e => context.error(e));
             }
         });

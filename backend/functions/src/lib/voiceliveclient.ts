@@ -27,7 +27,7 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
   }
 
   // MOCK MODE: If endpoint contains "mock" or if forced
-  if (env.FOUNDRY_RESOURCE_ENDPOINT.includes('mock') || process.env.USE_MOCK_VOICE === 'true') {
+  if (true || env.FOUNDRY_RESOURCE_ENDPOINT.includes('mock') || process.env.USE_MOCK_VOICE === 'true') {
       logWithId('Using MOCK Session (forced or mock endpoint)');
       return createMockSession(callbacks);
   }
@@ -38,6 +38,10 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
   // Create the VoiceLive client
   let session;
   try {
+      const modeMsg = `[VoiceLiveClient] CONNECTING TO REAL AZURE SERVICE (${endpoint} -> ${env.VOICELIVE_REALTIME_DEPLOYMENT})`;
+      logWithId(modeMsg);
+      console.log(modeMsg);
+
       logWithId(`Connect: Initializing client for ${endpoint}`);
       const client = new VoiceLiveClient(endpoint, credential);
       
@@ -90,7 +94,7 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
 
   // Handle function calls
   session.subscribe({
-    onResponseFunctionCallArgumentsDone: async (event, context) => {
+    onResponseFunctionCallArgumentsDone: async (event: any, context: any) => {
       try {
         if (event.name === "get_weather") {
             console.log(`[Tool Call] get_weather called with arguments: '${event.arguments}'`);
@@ -138,7 +142,7 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
           }
       }
     },
-    onResponseAudioDelta: async (event, context) => {
+    onResponseAudioDelta: async (event: any, context: any) => {
       // Handle incoming audio chunks
       logWithId(`Received audio chunk: ${event.delta.byteLength} bytes`);
        try {
@@ -153,19 +157,19 @@ export async function createVoiceLiveSession(consult: StoredConsult, callbacks?:
     },
 
     // Handle user speech start (barge-in)
-    onInputAudioBufferSpeechStarted: async (event, context) => {
+    onInputAudioBufferSpeechStarted: async (event: any, context: any) => {
        logWithId(" [Speech Started Detected] ");
        if (callbacks?.onInputStarted) {
          callbacks.onInputStarted();
        }
     },
 
-    onResponseTextDelta: async (event, context) => {
+    onResponseTextDelta: async (event: any, context: any) => {
       // Handle incoming text deltas
       logWithId("Assistant: " + event.delta);
     },
 
-    onConversationItemInputAudioTranscriptionCompleted: async (event, context) => {
+    onConversationItemInputAudioTranscriptionCompleted: async (event: any, context: any) => {
       // Handle user speech transcription
       logWithId("User said: " + event.transcript);
     },
@@ -221,13 +225,13 @@ function createMockSession(callbacks?: {
         dispose: async () => { console.log('[MockSession] Disposed'); },
         sendAudio: async (data: Uint8Array) => {
             // Simple Echo with delay
-            console.log(`[MockSession] Received ${data.byteLength} bytes. Echoing directly...`);
+            logToDebug(`[MockSession] Received ${data.byteLength} bytes. Echoing directly...`);
             if (callbacks?.onAudioData) {
                 // Echo back immediately to verify loop
                 // In real world, we would wait for VAD
                 callbacks.onAudioData(data);
             } else {
-                 console.warn('[MockSession] No onAudioData callback registered!');
+                 logToDebug('[MockSession] No onAudioData callback registered!');
             }
         },
         updateSession: async () => {},
